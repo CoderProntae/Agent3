@@ -204,8 +204,22 @@ class TestRuntimeStallDetection:
 
 class TestNonInteractiveEnvironment:
     def test_environment_announces_the_absence_of_a_human(self, runner):
-        result = runner.run("echo $CI-$DEBIAN_FRONTEND-$GIT_TERMINAL_PROMPT-$PIP_NO_INPUT")
-        assert result.stdout.strip() == "1-noninteractive-0-1"
+        result = runner.run(
+            'echo "${CI} ${DEBIAN_FRONTEND} ${GIT_TERMINAL_PROMPT}'
+            ' ${PIP_NO_INPUT} ${NPM_CONFIG_YES}"'
+        )
+        ci, frontend, git_prompt, pip_input, npm_yes = result.stdout.strip().split()
+        # `setdefault` semantics: a value inherited from the host (GitHub
+        # Actions exports CI=true) must win over our own default.
+        assert ci.lower() in {"1", "true"}
+        assert frontend == "noninteractive"
+        assert git_prompt == "0"
+        assert pip_input == "1"
+        assert npm_yes == "true"
+
+    def test_host_environment_is_not_clobbered(self, tmp_path):
+        runner = CommandRunner(tmp_path, env_overrides={"CI": "host-value"})
+        assert runner.run("echo $CI").stdout.strip() == "host-value"
 
     def test_editor_is_neutralised(self, runner):
         result = runner.run("echo $GIT_EDITOR $EDITOR")
