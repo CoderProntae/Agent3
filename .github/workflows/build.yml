@@ -157,6 +157,70 @@ jobs:
             if ($size -lt 10) { throw "$file looks truncated ($size MiB)" }
           }
 
+      # The unit tests run against the source tree, so they cannot prove that
+      # a *frozen* binary starts. These steps execute the real executables:
+      # --self-test builds the full Qt widget tree off-screen and exits 0.
+      # A missing hidden import, a wrongly excluded module (e.g. shiboken6) or
+      # an absent bundled resource fails the build here instead of on a user's
+      # machine.
+      #
+      # Both binaries are built windowed (no console), so their stdout goes
+      # nowhere: the verdict is taken from the process exit code and from the
+      # line the application writes into its own log file.
+      - name: Smoke test the frozen executables
+        shell: pwsh
+        timeout-minutes: 8
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          function Invoke-Exe {
+            param([string]$Exe, [string[]]$ExeArgs, [string]$DataHome)
+
+            if (Test-Path $DataHome) { Remove-Item -Recurse -Force $DataHome }
+            New-Item -ItemType Directory -Force -Path $DataHome | Out-Null
+            $env:AGENT3_HOME = $DataHome
+
+            Write-Host "--- $Exe $($ExeArgs -join ' ')"
+            $proc = Start-Process -FilePath $Exe -ArgumentList $ExeArgs -Wait -PassThru -NoNewWindow
+            $code = $proc.ExitCode
+
+            $log = Join-Path $DataHome "logs/agent3.log"
+            if (Test-Path $log) {
+              Write-Host "--- log ---"
+              Get-Content $log | ForEach-Object { Write-Host "    $_" }
+            } else {
+              Write-Host "    (no log file produced)"
+            }
+
+            if ($code -ne 0) {
+              throw "$Exe $($ExeArgs -join ' ') exited with $code"
+            }
+            return $log
+          }
+
+          # 1. --version must not even need a display.
+          Invoke-Exe -Exe "./dist/Agent3.exe" -ExeArgs @("--version") `
+                     -DataHome (Join-Path $env:RUNNER_TEMP "smoke-agent-version") | Out-Null
+          Invoke-Exe -Exe "./dist/UsageLimitEditor.exe" -ExeArgs @("--version") `
+                     -DataHome (Join-Path $env:RUNNER_TEMP "smoke-editor-version") | Out-Null
+
+          # 2. --self-test builds every widget, every icon and every Qt plugin.
+          $log = Invoke-Exe -Exe "./dist/Agent3.exe" -ExeArgs @("--self-test") `
+                            -DataHome (Join-Path $env:RUNNER_TEMP "smoke-agent")
+          if (-not (Select-String -Path $log -Pattern "self test OK" -Quiet)) {
+            throw "Agent3.exe did not report a successful self test"
+          }
+
+          $log = Invoke-Exe -Exe "./dist/UsageLimitEditor.exe" -ExeArgs @("--self-test") `
+                            -DataHome (Join-Path $env:RUNNER_TEMP "smoke-editor")
+          if (-not (Select-String -Path $log -Pattern "self test OK" -Quiet)) {
+            throw "UsageLimitEditor.exe did not report a successful self test"
+          }
+
+          Write-Host "Both executables start and build their UI correctly."
+
       - name: Stage the release folder
         shell: pwsh
         run: |

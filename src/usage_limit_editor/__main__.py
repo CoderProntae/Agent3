@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from typing import List, Optional
 
@@ -21,6 +22,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         prog="UsageLimitEditor", description="Administer Agent3 usage quotas"
     )
     parser.add_argument("--debug", action="store_true", help="verbose logging")
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="build the window off-screen, then exit (smoke test for frozen builds)",
+    )
     parser.add_argument("--version", action="version", version=f"{APP_TITLE} {__version__}")
     return parser.parse_args(argv)
 
@@ -33,6 +39,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     install_excepthook()
     logger = get_logger("usage_limit_editor")
     logger.info("starting %s %s", APP_TITLE, __version__)
+
+    if args.self_test:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        os.environ.setdefault("QT_OPENGL", "software")
 
     from PySide6.QtGui import QIcon
     from PySide6.QtWidgets import QApplication
@@ -52,6 +62,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     apply_theme(app)
 
     window = UsageLimitEditorWindow()
+
+    if args.self_test:
+        app.processEvents()
+        window.close()
+        logger.info("self test OK")
+        print(f"{APP_TITLE} {__version__} self test OK")
+        return 0
+
     window.show()
     return app.exec()
 

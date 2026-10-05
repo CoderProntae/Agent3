@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import List, Optional
@@ -29,6 +30,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--host", help="override the Ollama host (default: localhost)")
     parser.add_argument("--port", type=int, help="override the Ollama port (default: 11435)")
     parser.add_argument("--debug", action="store_true", help="verbose logging")
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="build the whole UI off-screen, then exit (smoke test for frozen builds)",
+    )
     parser.add_argument("--version", action="version", version=f"{APP_NAME} {__version__}")
     return parser.parse_args(argv)
 
@@ -41,6 +47,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     install_excepthook()
     logger = get_logger("agent3.app")
     logger.info("starting %s %s (log: %s)", APP_NAME, __version__, log_file)
+
+    if args.self_test:
+        # Force a headless Qt platform before the first PySide6 import so the
+        # smoke test works on CI runners without a desktop session.
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        os.environ.setdefault("QT_OPENGL", "software")
 
     # Imported late so that ``--version`` works without a display server.
     from PySide6.QtCore import Qt
@@ -82,6 +94,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     apply_theme(app, accent=config.ui.accent, font_size=config.ui.ui_font_size)
 
     window = MainWindow(config_manager)
+
+    if args.self_test:
+        # Exercise the real widget tree once, then shut down. This is what CI
+        # runs against the frozen executables: it fails loudly if a Qt module,
+        # a hidden import or a bundled resource is missing from the build.
+        app.processEvents()
+        window.close()
+        logger.info("self test OK - data directory: %s", app_paths().base)
+        print(f"{APP_NAME} {__version__} self test OK")
+        return 0
+
     window.show()
     logger.info("data directory: %s", app_paths().base)
     return app.exec()

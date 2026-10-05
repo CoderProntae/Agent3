@@ -46,12 +46,14 @@ EXCLUDED_MODULES = [
     "PySide6.QtNfc",
     "PySide6.QtScxml",
     "PySide6.QtStateMachine",
-    "shiboken6.Shiboken",
+    # NOTE: never exclude ``shiboken6`` or ``shiboken6.Shiboken`` here - it is
+    # the C++ binding layer that ``import PySide6`` loads first. Excluding it
+    # produces a binary that dies with
+    # "ModuleNotFoundError: No module named 'shiboken6.Shiboken'".
+    # Likewise, stdlib modules such as ``unittest`` stay in: several third
+    # party packages import them lazily and the size saving is negligible.
     # Scientific / dev-only packages that must never land in the binary.
     "tkinter",
-    "unittest",
-    "pydoc",
-    "doctest",
     "numpy",
     "pandas",
     "matplotlib",
@@ -64,6 +66,8 @@ EXCLUDED_MODULES = [
 
 #: Modules imported indirectly (plugin style) that PyInstaller cannot see.
 HIDDEN_IMPORTS = [
+    "shiboken6",
+    "shiboken6.Shiboken",
     "PySide6.QtCore",
     "PySide6.QtGui",
     "PySide6.QtWidgets",
