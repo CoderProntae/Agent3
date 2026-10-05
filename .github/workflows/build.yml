@@ -44,10 +44,10 @@ jobs:
     name: Tests (ubuntu)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
@@ -79,7 +79,7 @@ jobs:
         run: python -m compileall -q src
 
       - name: Upload coverage report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: coverage-report
           path: coverage.xml
@@ -92,10 +92,10 @@ jobs:
     runs-on: windows-latest
     needs: test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
@@ -164,7 +164,7 @@ jobs:
           Compress-Archive -Path release/* -DestinationPath Agent3-windows-x64.zip -Force
 
       - name: Upload Agent3.exe
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: Agent3-windows-exe
           path: dist/Agent3.exe
@@ -172,7 +172,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload UsageLimitEditor.exe
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: UsageLimitEditor-windows-exe
           path: dist/UsageLimitEditor.exe
@@ -180,7 +180,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload the full release bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: Agent3-windows-x64-bundle
           path: Agent3-windows-x64.zip
@@ -194,10 +194,10 @@ jobs:
     needs: build-windows
     if: startsWith(github.ref, 'refs/tags/v') || inputs.create_release
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Download the built bundle
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           pattern: "*windows*"
           merge-multiple: true
