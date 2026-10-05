@@ -146,6 +146,13 @@ class SettingsDialog(QDialog):
         self._stream = QCheckBox("Stream responses token by token")
         transport.addRow("", self._stream)
 
+        self._show_thinking = QCheckBox("Show the reasoning trace in the chat transcript")
+        self._show_thinking.setToolTip(
+            "Thinking models return their reasoning in a separate field. The effort level "
+            "itself is chosen under the message box, from the values the model reports."
+        )
+        transport.addRow("", self._show_thinking)
+
         self._temperature = QDoubleSpinBox()
         self._temperature.setRange(0.0, 2.0)
         self._temperature.setSingleStep(0.05)
@@ -200,6 +207,28 @@ class SettingsDialog(QDialog):
 
         self._confirm_destructive = QCheckBox("Confirm destructive operations (delete, rename)")
         form.addRow("", self._confirm_destructive)
+
+        self._auto_syntax = QCheckBox("Parse every written file and report syntax errors at once")
+        self._auto_syntax.setToolTip(
+            "Python, JSON, TOML, YAML, XML, INI, JavaScript and TypeScript are checked as soon "
+            "as the agent writes them, so a broken file is fixed in the step that caused it."
+        )
+        form.addRow("", self._auto_syntax)
+
+        self._external_linters = QCheckBox("Also run eslint / tsc / ruff when they are installed")
+        form.addRow("", self._external_linters)
+
+        self._max_processes = QSpinBox()
+        self._max_processes.setRange(1, 32)
+        self._max_processes.setToolTip(
+            "Background servers and watchers the agent may run at the same time"
+        )
+        form.addRow("Max background processes", self._max_processes)
+
+        self._snapshot_history = QSpinBox()
+        self._snapshot_history.setRange(5, 500)
+        self._snapshot_history.setToolTip("How many file changes `undo_file_change` can roll back")
+        form.addRow("Undo history (file changes)", self._snapshot_history)
 
         outer.addWidget(box)
         outer.addStretch(1)
@@ -294,6 +323,7 @@ class SettingsDialog(QDialog):
         self._temperature.setValue(float(ollama.temperature))
         self._num_ctx.setValue(int(ollama.num_ctx))
         self._num_predict.setValue(int(ollama.num_predict))
+        self._show_thinking.setChecked(bool(ollama.show_thinking))
 
         agent = config.agent
         self._max_iterations.setValue(int(agent.max_iterations))
@@ -303,6 +333,10 @@ class SettingsDialog(QDialog):
         self._max_output.setValue(int(agent.max_output_chars))
         self._auto_approve.setChecked(bool(agent.auto_approve_tools))
         self._confirm_destructive.setChecked(bool(agent.confirm_destructive))
+        self._auto_syntax.setChecked(bool(agent.auto_syntax_check))
+        self._external_linters.setChecked(bool(agent.run_external_linters))
+        self._max_processes.setValue(int(agent.max_background_processes))
+        self._snapshot_history.setValue(int(agent.snapshot_history))
 
         github = config.github
         self._gh_username.setText(github.username)
@@ -337,6 +371,7 @@ class SettingsDialog(QDialog):
         ollama.temperature = float(self._temperature.value())
         ollama.num_ctx = int(self._num_ctx.value())
         ollama.num_predict = int(self._num_predict.value())
+        ollama.show_thinking = bool(self._show_thinking.isChecked())
 
         agent = config.agent
         agent.max_iterations = int(self._max_iterations.value())
@@ -346,6 +381,10 @@ class SettingsDialog(QDialog):
         agent.max_output_chars = int(self._max_output.value())
         agent.auto_approve_tools = bool(self._auto_approve.isChecked())
         agent.confirm_destructive = bool(self._confirm_destructive.isChecked())
+        agent.auto_syntax_check = bool(self._auto_syntax.isChecked())
+        agent.run_external_linters = bool(self._external_linters.isChecked())
+        agent.max_background_processes = int(self._max_processes.value())
+        agent.snapshot_history = int(self._snapshot_history.value())
 
         github = config.github
         github.username = self._gh_username.text().strip()

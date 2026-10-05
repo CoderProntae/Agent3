@@ -66,12 +66,67 @@ python -m usage_limit_editor   # yönetici aracı
 
 | Bölge | İçerik |
 |---|---|
-| Üst araç çubuğu | Çalışma klasörü · model seçici · bağlantı durumu |
-| Sol kenar çubuğu | Dosya gezgini · oturum (sohbet) listesi · kullanım/kota göstergeleri |
+| Üst araç çubuğu | Çalışma klasörü ve menüler |
+| Sol kenar çubuğu | Dosya gezgini · **ajan planı (PLAN)** · oturum listesi · kullanım/kota göstergeleri |
 | Orta panel | Sohbet (markdown + kod vurgulama) ve canlı eylem kartları |
+| **Mesaj kutusunun altındaki şerit** | **Model seçici · düşünme anahtarı · düşünme düzeyi · bağlantı durumu** |
 | Sağ panel | Sekmeli kod düzenleyici + satır içi / yan yana fark görüntüleyici |
-| Alt panel | Gömülü terminal (ajan çıktısı + kendi komutlarınız, yukarı okla geçmiş) |
+| Alt panel | Gömülü terminal; başlıkta `● N background` rozeti arka planda çalışan süreçleri gösterir |
 | Durum çubuğu | Ajan durumu · bugünkü token · istek kotası |
+
+### Model ve düşünme şeridi
+
+Model seçici artık üst çubukta değil, **yazdığınız kutunun hemen altında** —
+çünkü her mesajda değiştirebileceğiniz ayarlar oraya aittir.
+
+| Kontrol | Ne yapar |
+|---|---|
+| `◆ model` | Sunucuda kurulu modeller; elle de yazabilirsiniz |
+| `Thinking` kutusu | Modelin yanıtlamadan önce akıl yürütmesini açar/kapatır |
+| `effort` listesi | Düşünme düzeyi |
+| `● online · …` | Ollama bağlantı durumu (üstüne gelin: sürüm ve adres) |
+
+**Önemli:** bu seçeneklerin içeriği uydurulmaz. Agent3 model değiştiğinde
+Ollama'ya `/api/show` sorar ve modelin bildirdiği `thinking.values` listesini
+aynen gösterir:
+
+* `qwen3`, `deepseek-r1` gibi modeller → sadece **açık/kapalı**;
+* `gpt-oss` → sadece **low / medium / high**, ve kapatılamaz (kutu kilitli görünür);
+* bazı modellerde ek olarak **max**;
+* düşünme yeteneği olmayan bir model → kontrol **gri** ve "no reasoning" yazar.
+
+Modelin kabul etmediği bir değer isteğe hiç konmaz, böylece sunucu isteği
+tümden reddetmez. Akıl yürütme metni yanıttan ayrı bir **"Reasoning"**
+bloğunda akar; blok varsayılan olarak kapalıdır, tıklayarak açarsınız.
+
+### PLAN paneli
+
+Ajan iki adımdan uzun işlerde önce planını yazar (`manage_tasks` aracı).
+Sol kenar çubuğundaki PLAN bölümü bunu canlı gösterir: `✓` biten,
+`◐` üzerinde çalışılan, `○` bekleyen adım; üstte `1/4` sayacı ve ilerleme
+çubuğu. Planda açık madde kaldığı sürece ajanın "bitirdim" demesi bir kez
+reddedilir.
+
+### Arka plan süreçleri
+
+`npm run dev`, `uvicorn`, `watch` gibi bitmeyen komutlar `run_command` ile
+değil `start_process` ile çalıştırılır; ajan beklemeden işine devam eder,
+çıktısını `get_process_logs` ile okur, işi bitince `stop_process` ile kapatır.
+Terminal başlığındaki `● N background` rozeti kaç sürecin ayakta olduğunu
+söyler. Uygulamayı kapattığınızda bu süreçler otomatik sonlandırılır.
+
+### Yazılan her dosya denetlenir
+
+Ajan bir dosya yazdığı anda dosya ayrıştırılır (Python, JSON, TOML, YAML, XML,
+INI, JavaScript, TypeScript; kuruluysa ayrıca `eslint` / `tsc` / `ruff`).
+Sonuç araç çıktısına eklenir:
+
+* `… [syntax OK (python-ast)]` → temiz;
+* `SYNTAX ERROR x1 … line 42` → araç çağrısı **başarısız** sayılır ve ajan o
+  adımda düzeltmek zorundadır; bozuk dosya varken `finish` reddedilir.
+
+Bir düzenleme kötü gittiyse ajan `undo_file_change` ile dosyayı tek hamlede
+önceki hâline döndürür (yeni oluşturulmuş bir dosyaysa siler).
 
 **Kısayollar:** `Ctrl+O` klasör aç · `Ctrl+Enter` çalıştır · `Esc` durdur · `Ctrl+S` kaydet ·
 `Ctrl+N` yeni oturum · `Ctrl+,` ayarlar · ``Ctrl+` `` terminali aç/kapat.

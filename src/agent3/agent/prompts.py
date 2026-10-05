@@ -37,7 +37,10 @@ You operate directly on the user's workspace: you read files, write code, run sh
 8. Commands must be NON-INTERACTIVE. Nobody can answer a prompt: always pass the flag that accepts defaults (`npm init -y`, `apt-get install -y`, `git commit -m "..."`, `pip uninstall -y`). Never start an editor, a pager or a REPL (`vim`, `less`, `python` with no arguments).
 9. Explore cheaply. Call `view_outline` before `read_file` on any file over ~150 lines, then read only the line range you need.
 10. Changing a file in several places is ONE `patch_file` call, not three `edit_file` calls.
-11. When the task is done - and only then - call the `finish` tool with a summary of what changed and how you verified it.
+11. Long-running commands (dev servers, watchers, `npm run dev`) go to `start_process`, never to `run_command` - `run_command` waits for the command to exit and a server never exits. Read its output with `get_process_logs` and shut it down with `stop_process`.
+12. For any task with more than two steps, write the plan down first with `manage_tasks` (action=add), then flip each item to `in_progress` / `completed` as you go. Never finish with pending items.
+13. Every file you write is parsed automatically. If the result says SYNTAX ERROR, fix it in your very next call - do not move on, do not finish. `undo_file_change` rolls a bad edit back in one step.
+14. When the task is done - and only then - call the `finish` tool with a summary of what changed and how you verified it.
 
 ## Definition of done - the checklist for `finish`
 You may ONLY call `finish` once every box below is ticked. If one is not, do that instead of finishing.
@@ -104,6 +107,26 @@ FAILED_VERIFY_HINT = """STOP - your last verification command failed.
 `{command}` exited with {exit_code}. A failing check is not a finished task:
 read the error above, fix the root cause in the code, and run the command again
 until it passes. Only then call `finish`."""
+
+SYNTAX_HINT = """STOP - you are leaving broken code behind.
+
+{files}
+
+A file that does not parse is not finished work. Open it, fix the error that is
+reported above, and re-check it with `check_syntax`. Only then call `finish`.
+If the edit went badly wrong, call `undo_file_change` and redo it cleanly."""
+
+TASKS_HINT = """STOP - your own plan still has open items:
+
+{tasks}
+
+Either do the remaining work now, or - if an item turned out to be unnecessary -
+mark it with `manage_tasks` (status `completed` or `cancelled`) and say why in
+your summary. Do not finish with a plan that is silently unfinished."""
+
+PROCESS_HINT = """You still have background process(es) running: {processes}.
+Stop what you started with `stop_process` before you finish, unless the user
+explicitly asked for a server to stay up."""
 
 LOOP_HINT = """You have repeated the same tool call several times without progress.
 Try a fundamentally different approach: inspect the current state of the files

@@ -123,7 +123,68 @@ user instruction
 | `search_code` | Literal or regex grep across the workspace |
 | `run_command` | Shell execution with capture, timeout, a destructive-command deny-list and an interactive-command trap |
 | `git` | `status · init · add · commit · diff · log · branch · checkout · push · pull` |
-| `finish` | Ends the run - refused until the changes have been verified |
+| `start_process` | Launch a dev server / watcher in the **background** and keep working; returns a `process_id` |
+| `get_process_logs` | Tail a background process's captured output, or list every process and its state |
+| `stop_process` | Terminate a background process tree (`process_id="all"` stops everything) |
+| `manage_tasks` | The agent's visible plan: `add · update · list · set · remove · clear`, statuses `pending / in_progress / completed / cancelled` (alias `todo_list`) |
+| `check_syntax` | Parse and lint a file or a snippet without executing it |
+| `undo_file_change` | Roll a file back to the state it had before the last tool touched it (alias `rollback_file`) |
+| `finish` | Ends the run - refused while code is broken, the plan is unfinished, or the changes are unverified |
+
+### Reasoning control
+
+Ollama returns a model's reasoning in a separate `message.thinking` field and
+accepts a `think` request field, but **the accepted values differ per model**:
+most thinking models take `true`/`false`, gpt-oss takes only `low`/`medium`/`high`
+and cannot be switched off, and some models add `max`. Agent3 therefore never
+hard-codes a list. It calls `/api/show`, reads the `thinking` object
+(`{"values": [...], "default": ...}`), and builds the control strip under the
+message box from exactly those values:
+
+* a model with no thinking capability shows a disabled control, not fake levels;
+* a model that cannot stop reasoning shows the switch locked on;
+* a value the model does not accept is dropped before the request is sent,
+  instead of making the server reject the whole call.
+
+The reasoning trace is streamed into its own collapsed block in the transcript
+and is never fed to the tool-call parser, so the model's scratchpad can never
+be mistaken for an action.
+
+### Long-running processes
+
+`run_command` waits for the command to exit - which a dev server never does.
+`start_process` spawns the command in its own session/process group, streams
+stdout and stderr into a bounded ring buffer, and hands back a `process_id`.
+The same deny-list and non-interactive environment as `run_command` apply, the
+terminal panel shows a `● N background` badge, and every process is killed when
+the window closes. No orphan servers.
+
+### The plan
+
+For anything with more than two steps the system prompt requires the model to
+write its plan down with `manage_tasks` before touching code, and to flip each
+item as it goes. The list is mirrored live into the sidebar, and `finish` is
+refused once while items are still open - a run that quietly abandons half the
+request is the failure mode this closes.
+
+### Checked on write
+
+Every file the agent writes is parsed immediately: Python through `ast`, JSON,
+TOML, YAML, XML and INI through the standard library, JavaScript through
+`node --check`, TypeScript through `tsc --noEmit`, plus `eslint`/`ruff` when
+they are installed and configured. The verdict is appended to the tool result,
+so a syntax error is visible in the step that caused it rather than three calls
+later. A broken file turns the tool call into a failure and blocks `finish`.
+External linters are strictly optional: a missing binary is reported as
+"skipped", never as an error.
+
+### Undo
+
+Every mutating tool snapshots the file's previous content in memory before it
+writes. `undo_file_change` restores the newest snapshot - deleting the file
+again if it did not exist before - so a bad edit is one call away from being
+reverted instead of being patched over by hand. The buffer is bounded by both
+entry count and total bytes.
 
 ### Cheap exploration
 

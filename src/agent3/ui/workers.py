@@ -28,7 +28,10 @@ class AgentWorker(QThread):
 
     status_changed = Signal(str)
     assistant_delta = Signal(str)
+    thinking_delta = Signal(str)
     assistant_message = Signal(str)
+    tasks_changed = Signal(object)          # TaskList
+    processes_changed = Signal()
     tool_started = Signal(object)          # ToolCall
     tool_finished = Signal(object, object)  # ToolCall, ToolResult
     command_output = Signal(str, str)       # stream, text
@@ -55,7 +58,9 @@ class AgentWorker(QThread):
         self._loop.callbacks = AgentCallbacks(
             on_status=self.status_changed.emit,
             on_assistant_delta=self.assistant_delta.emit,
+            on_thinking_delta=self.thinking_delta.emit,
             on_assistant_message=self.assistant_message.emit,
+            on_tasks_changed=self.tasks_changed.emit,
             on_tool_start=self._emit_tool_start,
             on_tool_result=self._emit_tool_result,
             on_usage=self.usage_updated.emit,
@@ -63,6 +68,8 @@ class AgentWorker(QThread):
         )
         self._loop.context.on_command_output = self.command_output.emit
         self._loop.context.on_file_changed = self.file_changed.emit
+        self._loop.context.on_tasks_changed = self.tasks_changed.emit
+        self._loop.context.on_processes_changed = self.processes_changed.emit
         try:
             self._result = self._loop.run(self._message)
         except Exception as exc:  # pragma: no cover - the loop already guards
@@ -74,6 +81,7 @@ class AgentWorker(QThread):
         finally:
             self._loop.context.on_command_output = None
             self._loop.context.on_file_changed = None
+            self._loop.context.on_processes_changed = None
         self.finished_run.emit(self._result)
 
     def _emit_tool_start(self, call: ToolCall) -> None:
@@ -116,6 +124,32 @@ class CommandWorker(QThread):
                 command=self._command, cwd=str(self._runner.cwd), exit_code=1, stderr=trace, error=str(exc)
             )
         self.completed.emit(result)
+
+
+class ModelCapabilityWorker(QThread):
+    """Asks Ollama what a model can do, off the UI thread.
+
+    ``/api/show`` is a real HTTP round trip and the answer decides which
+    reasoning controls the composer strip may offer, so it must never run on
+    the GUI thread: a cold model listing can take seconds.
+    """
+
+    completed = Signal(str, object)  # model, ThinkingSupport
+
+    def __init__(self, client, model: str, parent: Optional[QObject] = None) -> None:
+        super().__init__(parent)
+        self._client = client
+        self._model = model
+
+    def run(self) -> None:  # noqa: D102
+        from agent3.llm.ollama_client import ThinkingSupport
+
+        try:
+            support = self._client.thinking_support(self._model)
+        except Exception as exc:  # pragma: no cover - the client swallows already
+            logger.debug("capability probe for %s failed: %s", self._model, exc)
+            support = ThinkingSupport(model=self._model)
+        self.completed.emit(self._model, support)
 
 
 class HealthWorker(QThread):

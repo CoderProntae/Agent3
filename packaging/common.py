@@ -77,6 +77,12 @@ HIDDEN_IMPORTS = [
     "cryptography.hazmat.backends.openssl",
     "sqlite3",
     "encodings.idna",
+    # Standard-library parsers used by the automatic syntax checker. They are
+    # imported lazily inside agent3.workspace.syntax_check, which PyInstaller's
+    # static analysis would otherwise miss.
+    "tomllib",
+    "configparser",
+    "xml.etree.ElementTree",
 ]
 
 

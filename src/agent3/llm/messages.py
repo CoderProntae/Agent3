@@ -88,7 +88,10 @@ class Usage:
 class StreamEvent:
     """One chunk of a streamed completion.
 
-    ``delta`` carries the newly produced text; the final event has
+    ``delta`` carries the newly produced answer text; ``thinking`` carries the
+    model's reasoning trace, which Ollama streams in a *separate*
+    ``message.thinking`` field so it never contaminates the answer (and, for
+    this agent, never gets parsed as a tool call). The final event has
     ``done=True`` and a populated :class:`Usage`.
     """
 
@@ -97,3 +100,9 @@ class StreamEvent:
     usage: Optional[Usage] = None
     model: str = ""
     raw: Dict[str, Any] = field(default_factory=dict)
+    thinking: str = ""
+
+    @property
+    def has_payload(self) -> bool:
+        """True when the chunk carried any text at all."""
+        return bool(self.delta or self.thinking)

@@ -65,7 +65,12 @@ from agent3.ui.widgets.session_list import SessionList
 from agent3.ui.widgets.settings_dialog import SettingsDialog
 from agent3.ui.widgets.terminal_panel import TerminalPanel
 from agent3.ui.widgets.usage_panel import UsagePanel
-from agent3.ui.workers import AgentWorker, HealthWorker
+from agent3.agent.tasks import TaskList
+from agent3.workspace.processes import ProcessManager
+from agent3.workspace.snapshots import SnapshotStore
+from agent3.ui.widgets.composer_bar import ComposerBar
+from agent3.ui.widgets.task_panel import TaskPanel
+from agent3.ui.workers import AgentWorker, HealthWorker, ModelCapabilityWorker
 from agent3.workspace.fs import WorkspaceFS
 from agent3.workspace.git_ops import GitRepo
 from agent3.workspace.terminal import CommandRunner
@@ -111,9 +116,11 @@ class MainWindow(QMainWindow):
         self.runner: Optional[CommandRunner] = None
         self.git: Optional[GitRepo] = None
         self.tool_context: Optional[ToolContext] = None
+        self.processes: Optional[ProcessManager] = None
         self.loop: Optional[AgentLoop] = None
         self.worker: Optional[AgentWorker] = None
         self._health_worker: Optional[HealthWorker] = None
+        self._capability_worker: Optional[ModelCapabilityWorker] = None
         self._active_cards: dict[int, ActionCard] = {}
         self._card_counter = 0
         self._current_session_id = ""
@@ -145,17 +152,9 @@ class MainWindow(QMainWindow):
         self.toolbar.addWidget(self._workspace_label)
         self.toolbar.addSeparator()
 
-        self.toolbar.addWidget(QLabel(" Model "))
-        self._model_box = QComboBox()
-        self._model_box.setEditable(True)
-        self._model_box.setMinimumWidth(240)
-        self._model_box.setEditText(self.config.ollama.model)
-        self._model_box.currentTextChanged.connect(self._on_model_changed)
-        self.toolbar.addWidget(self._model_box)
-
-        self._connection_label = QLabel("  ● connecting...")
-        self._connection_label.setStyleSheet(f"color: {COLORS.warning}; padding: 0 10px;")
-        self.toolbar.addWidget(self._connection_label)
+        # The model picker and the reasoning controls deliberately do NOT live
+        # here: they belong next to the box you type in, so they are built as
+        # part of the composer strip further down.
 
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -174,6 +173,9 @@ class MainWindow(QMainWindow):
         self.usage_panel = UsagePanel()
         self.usage_panel.editor_button.clicked.connect(self.open_usage_editor)
 
+        #: Live view of the plan the agent maintains with `manage_tasks`.
+        self.task_panel = TaskPanel()
+
         explorer_header = QLabel("EXPLORER")
         explorer_header.setObjectName("SectionTitle")
 
@@ -185,9 +187,10 @@ class MainWindow(QMainWindow):
         explorer_layout.addWidget(explorer_header)
         explorer_layout.addWidget(self.tree, 1)
         sidebar.addWidget(explorer_box)
+        sidebar.addWidget(self.task_panel)
         sidebar.addWidget(self.session_list)
         sidebar.addWidget(self.usage_panel)
-        sidebar.setSizes([420, 220, 300])
+        sidebar.setSizes([330, 250, 170, 290])
         sidebar.setMinimumWidth(240)
 
         # ---------------------------------------------------------- chat
@@ -212,6 +215,13 @@ class MainWindow(QMainWindow):
         self.composer = Composer(self.send_message)
         self.composer.setFont(mono_font(10))
 
+        # Everything you tune per message sits directly under the input box.
+        self.composer_bar = ComposerBar()
+        self.composer_bar.set_model(self.config.ollama.model)
+        self.composer_bar.set_think_spec(self.config.ollama.think)
+        self.composer_bar.model_changed.connect(self._on_model_changed)
+        self.composer_bar.think_changed.connect(self._on_think_changed)
+
         composer_row = QHBoxLayout()
         composer_row.setSpacing(8)
         self._run_button = QPushButton("Run agent  (Ctrl+Enter)")
@@ -235,6 +245,7 @@ class MainWindow(QMainWindow):
         center_layout.addWidget(self.quota_banner)
         center_layout.addWidget(self.chat, 1)
         center_layout.addWidget(self.composer, 0)
+        center_layout.addWidget(self.composer_bar, 0)
         center_layout.addLayout(composer_row)
 
         # -------------------------------------------------------- editor
@@ -376,8 +387,10 @@ class MainWindow(QMainWindow):
 
     def check_connection(self) -> None:
         """Ping Ollama in the background and update the toolbar badge."""
-        self._connection_label.setText("  ● connecting...")
-        self._connection_label.setStyleSheet(f"color: {COLORS.warning}; padding: 0 10px;")
+        self.composer_bar.set_connection(False, "connecting…")
+        self.composer_bar.connection_label.setStyleSheet(
+            f"color: {COLORS.warning}; font-size: 11px;"
+        )
         worker = HealthWorker(self.client, parent=self)
         worker.completed.connect(self._on_health)
         self._health_worker = worker
@@ -387,15 +400,16 @@ class MainWindow(QMainWindow):
     def _on_health(self, payload: dict) -> None:
         if payload.get("ok"):
             models = payload.get("models", [])
-            current = self._model_box.currentText()
-            self._model_box.blockSignals(True)
-            self._model_box.clear()
-            self._model_box.addItems(models)
-            self._model_box.setEditText(current or self.config.ollama.model)
-            self._model_box.blockSignals(False)
+            current = self.composer_bar.current_model() or self.config.ollama.model
+            self.composer_bar.set_models(models, current)
             endpoint = payload.get("endpoint", self.config.ollama.base_url)
-            self._connection_label.setText(f"  ● online · {endpoint}")
-            self._connection_label.setStyleSheet(f"color: {COLORS.success}; padding: 0 10px;")
+            version = payload.get("version", "")
+            self.composer_bar.set_connection(
+                True,
+                f"online · {endpoint}",
+                f"Ollama {version} at {endpoint}" if version else str(endpoint),
+            )
+            self.refresh_model_capabilities(current)
             if current and models and current not in models:
                 self.chat.add_notice(
                     f"Model '{current}' is not installed on the server. "
@@ -403,13 +417,50 @@ class MainWindow(QMainWindow):
                     "error",
                 )
         else:
-            self._connection_label.setText(f"  ● offline · {self.config.ollama.base_url}")
-            self._connection_label.setStyleSheet(f"color: {COLORS.danger}; padding: 0 10px;")
+            self.composer_bar.set_connection(
+                False,
+                f"offline · {self.config.ollama.base_url}",
+                str(payload.get("error", "")),
+            )
             self.chat.add_notice(
                 f"Cannot reach Ollama at {self.config.ollama.base_url}. "
                 "Start it with: OLLAMA_HOST=127.0.0.1:11435 ollama serve",
                 "error",
             )
+
+    def refresh_model_capabilities(self, model: str = "") -> None:
+        """Ask the server what the selected model supports, then rebuild the
+        reasoning controls from the answer - never from a guess."""
+        name = (model or self.composer_bar.current_model()).strip()
+        if not name:
+            return
+        if self._capability_worker is not None and self._capability_worker.isRunning():
+            return
+        worker = ModelCapabilityWorker(self.client, name, parent=self)
+        worker.completed.connect(self._on_capabilities)
+        self._capability_worker = worker
+        worker.start()
+
+    @Slot(str, object)
+    def _on_capabilities(self, model: str, support) -> None:
+        if model.strip() != self.composer_bar.current_model().strip():
+            return  # the user moved on to another model while we were asking
+        self.composer_bar.set_thinking_support(support, self.config.ollama.think)
+        spec = self.composer_bar.think_spec()
+        if spec != self.config.ollama.think:
+            self.config.ollama.think = spec
+            self.config_manager.save()
+        if self.loop is not None:
+            self.loop.think = spec
+
+    def _on_think_changed(self, spec: str) -> None:
+        """Persist the reasoning setting and apply it to the running loop."""
+        self.config.ollama.think = spec
+        self.client.settings.think = spec
+        self.config_manager.save()
+        if self.loop is not None:
+            self.loop.think = spec
+        self.statusBar().showMessage(self.composer_bar.thinking_summary(), 2500)
 
     # ========================================================== workspace
     def choose_workspace(self) -> None:
@@ -436,12 +487,22 @@ class MainWindow(QMainWindow):
             interactive_idle_seconds=self.config.agent.interactive_idle_seconds,
         )
         self.git = GitRepo(fs.root)
+        self.processes = ProcessManager(
+            self.runner,
+            max_processes=self.config.agent.max_background_processes,
+            max_log_lines=self.config.agent.process_log_lines,
+        )
         self.tool_context = ToolContext(
             fs=fs,
             runner=self.runner,
             git=self.git,
             command_timeout=self.config.agent.command_timeout,
             max_output_chars=self.config.agent.max_output_chars,
+            processes=self.processes,
+            snapshots=SnapshotStore(max_entries=self.config.agent.snapshot_history),
+            tasks=TaskList(),
+            auto_syntax_check=self.config.agent.auto_syntax_check,
+            run_external_linters=self.config.agent.run_external_linters,
         )
         self.loop = AgentLoop(
             self.client,
@@ -449,12 +510,15 @@ class MainWindow(QMainWindow):
             self.tool_context,
             self.usage,
             self.config.agent,
-            model=self._model_box.currentText() or self.config.ollama.model,
+            model=self.composer_bar.current_model() or self.config.ollama.model,
         )
+        self.loop.think = self.composer_bar.think_spec()
 
         self.tree.set_workspace(fs)
         self.editor.set_workspace(fs)
         self.terminal.set_runner(self.runner)
+        self.task_panel.clear()
+        self._update_process_badge()
         self._workspace_label.setText(f"  {fs.root}")
         self.setWindowTitle(f"{APP_NAME} - {fs.root.name}")
 
@@ -476,7 +540,7 @@ class MainWindow(QMainWindow):
     def new_session(self, silent: bool = False) -> None:
         session = self.sessions.create(
             workspace=str(self.fs.root) if self.fs else "",
-            model=self._model_box.currentText(),
+            model=self.composer_bar.current_model(),
         )
         self._current_session_id = session.id
         self.usage.start_session(session.id)
@@ -567,7 +631,7 @@ class MainWindow(QMainWindow):
                 self.sessions.autoname(self._current_session_id, text)
                 self._refresh_sessions()
 
-        self.loop.model = self._model_box.currentText() or self.config.ollama.model
+        self.loop.model = self.composer_bar.current_model() or self.config.ollama.model
         self.loop.settings = self.config.agent
         self._active_cards.clear()
         self._set_running(True)
@@ -575,6 +639,9 @@ class MainWindow(QMainWindow):
         worker = AgentWorker(self.loop, text, parent=self)
         worker.status_changed.connect(self._on_status)
         worker.assistant_delta.connect(self.chat.append_assistant_delta)
+        worker.thinking_delta.connect(self._on_thinking_delta)
+        worker.tasks_changed.connect(self._on_tasks_changed)
+        worker.processes_changed.connect(self._update_process_badge)
         worker.assistant_message.connect(self._on_assistant_message)
         worker.tool_started.connect(self._on_tool_started)
         worker.tool_finished.connect(self._on_tool_finished)
@@ -587,11 +654,16 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def stop_agent(self) -> None:
+        if self.processes is not None and self.processes.running_count:
+            stopped = self.processes.stop_all()
+            logger.info("stopped %d background process(es) on exit", len(stopped))
+
         if self.worker is not None and self.worker.isRunning():
             self.worker.cancel()
             self._on_status("stopping...")
 
     def _set_running(self, running: bool) -> None:
+        self.composer_bar.set_busy(running)
         self._run_button.setEnabled(not running)
         self._stop_button.setEnabled(running)
         self.composer.setReadOnly(running)
@@ -606,6 +678,31 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def _on_status(self, text: str) -> None:
         self._status_text.setText(text)
+
+    @Slot(str)
+    def _on_thinking_delta(self, delta: str) -> None:
+        """Stream the reasoning trace into its own collapsible block."""
+        if not self.config.ollama.show_thinking:
+            return
+        self.chat.append_thinking_delta(delta)
+
+    @Slot(object)
+    def _on_tasks_changed(self, tasks) -> None:
+        """Mirror the agent's plan into the sidebar."""
+        try:
+            items = list(tasks)
+        except TypeError:  # pragma: no cover - defensive
+            return
+        self.task_panel.set_tasks(items)
+        summary = tasks.summary_line() if hasattr(tasks, "summary_line") else ""
+        if summary:
+            self.statusBar().showMessage(f"Plan: {summary}", 4000)
+
+    @Slot()
+    def _update_process_badge(self) -> None:
+        """Show how many background processes the agent left running."""
+        count = self.processes.running_count if self.processes is not None else 0
+        self.terminal.set_process_count(count)
 
     @Slot(str)
     def _on_assistant_message(self, text: str) -> None:
@@ -822,13 +919,18 @@ class MainWindow(QMainWindow):
         if dialog.exec():
             self.config = self.config_manager.config
             self.client.update_settings(self.config.ollama)
-            self._model_box.setEditText(self.config.ollama.model)
+            self.composer_bar.set_model(self.config.ollama.model)
+            self.composer_bar.set_think_spec(self.config.ollama.think)
             if self.runner is not None:
                 self.runner.default_timeout = self.config.agent.command_timeout
                 self.runner.set_blocked_patterns(self.config.agent.blocked_command_patterns)
             if self.tool_context is not None:
                 self.tool_context.command_timeout = self.config.agent.command_timeout
                 self.tool_context.max_output_chars = self.config.agent.max_output_chars
+                self.tool_context.auto_syntax_check = self.config.agent.auto_syntax_check
+                self.tool_context.run_external_linters = self.config.agent.run_external_linters
+            if self.processes is not None:
+                self.processes.max_processes = self.config.agent.max_background_processes
             if self.loop is not None:
                 self.loop.settings = self.config.agent
             self.check_connection()
@@ -842,6 +944,8 @@ class MainWindow(QMainWindow):
             self.loop.model = model.strip()
         if self._current_session_id:
             self.sessions.set_model(self._current_session_id, model.strip())
+        # Reasoning levels are per model: re-ask the server what this one takes.
+        self.refresh_model_capabilities(model.strip())
 
     def _open_logs(self) -> None:
         folder = app_paths().log_dir

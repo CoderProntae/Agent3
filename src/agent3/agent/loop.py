@@ -15,6 +15,9 @@ from typing import Callable, Dict, List, Optional, Sequence
 
 from agent3.agent.prompts import (
     FAILED_VERIFY_HINT,
+    PROCESS_HINT,
+    SYNTAX_HINT,
+    TASKS_HINT,
     LOOP_HINT,
     NO_TOOL_HINT,
     RETRY_HINT,
@@ -51,6 +54,10 @@ class AgentCallbacks:
 
     on_status: Optional[Callable[[str], None]] = None
     on_assistant_delta: Optional[Callable[[str], None]] = None
+    #: Reasoning fragments, streamed separately from the answer.
+    on_thinking_delta: Optional[Callable[[str], None]] = None
+    #: The task list changed (added, updated, completed).
+    on_tasks_changed: Optional[Callable[[object], None]] = None
     on_assistant_message: Optional[Callable[[str], None]] = None
     on_tool_start: Optional[Callable[[ToolCall], None]] = None
     on_tool_result: Optional[Callable[[ToolCall, ToolResult], None]] = None
@@ -87,6 +94,10 @@ class AgentRunResult:
     verified: bool = False
     #: The command used as proof, when there is one.
     verification_command: str = ""
+    #: Reasoning trace of the last step, when the model emitted one.
+    thinking: str = ""
+    #: Files the agent left with a syntax error it never repaired.
+    broken_files: List[str] = field(default_factory=list)
 
     @property
     def total_tokens(self) -> int:
@@ -122,6 +133,17 @@ class AgentLoop:
         self.extra_instructions = extra_instructions
         self.history: List[ChatMessage] = []
         self._cancel = threading.Event()
+        #: Reasoning spec forwarded to Ollama's ``think`` field. ``None`` means
+        #: "use whatever the connection settings say".
+        self.think: Optional[str] = None
+        # The tool layer owns the plan and the undo buffer; make sure they
+        # exist up front so the UI can bind to them before the first run.
+        self.context.task_list()
+        self.context.snapshot_store()
+        if self.context.on_tasks_changed is None:
+            self.context.on_tasks_changed = lambda tasks: self.callbacks.emit(
+                "on_tasks_changed", tasks
+            )
 
     # ------------------------------------------------------------- control
     def cancel(self) -> None:
@@ -200,6 +222,10 @@ class AgentLoop:
         last_failed_exit = 0
         nudges_left = max(0, int(getattr(self.settings, "verification_nudges", 1)))
         require_verification = bool(getattr(self.settings, "require_verification", True))
+        #: path -> syntax report, for files the agent left unparseable.
+        broken: Dict[str, str] = {}
+        syntax_nudges = 2
+        task_nudges = 1
 
         try:
             for iteration in range(1, max_iterations + 1):
@@ -232,7 +258,10 @@ class AgentLoop:
                         model=self.model,
                         cancel=self._cancel,
                         on_delta=lambda delta: self.callbacks.emit("on_assistant_delta", delta),
+                        think=self.think,
+                        on_thinking=lambda delta: self.callbacks.emit("on_thinking_delta", delta),
                     )
+                    result.thinking = getattr(self.client, "last_thinking", "")
                 except OllamaCancelled:
                     result.stop_reason = AgentStopReason.CANCELLED
                     break
@@ -294,9 +323,43 @@ class AgentLoop:
                 if call.name == "finish":
                     summary = str(call.args.get("summary") or call.args.get("message") or prose or "Task complete.")
 
-                    # Definition of done: code that was never executed is not
-                    # finished work. Push the model back to its test command
-                    # instead of accepting an optimistic summary.
+                    # Gate 1 - broken code. A file that does not parse is not
+                    # finished work, whatever the summary claims.
+                    if broken and syntax_nudges > 0:
+                        syntax_nudges -= 1
+                        listing = "\n\n".join(
+                            f"{path}:\n{report.strip()[:600]}" for path, report in broken.items()
+                        )
+                        self._refuse_finish(
+                            call,
+                            "finish refused: files with syntax errors",
+                            SYNTAX_HINT.format(files=listing),
+                            f"Broken file(s): {', '.join(broken)}",
+                        )
+                        consecutive_failures = 0
+                        continue
+
+                    # Gate 2 - the model's own plan still has open items.
+                    tasks = self.context.tasks
+                    if (
+                        task_nudges > 0
+                        and tasks is not None
+                        and getattr(tasks, "open_tasks", [])
+                        and len(tasks) > 1
+                    ):
+                        task_nudges -= 1
+                        self._refuse_finish(
+                            call,
+                            "finish refused: the plan is not finished",
+                            TASKS_HINT.format(tasks=tasks.render()),
+                            f"{len(tasks.open_tasks)} task(s) still open",
+                        )
+                        consecutive_failures = 0
+                        continue
+
+                    # Gate 3 - definition of done: code that was never executed
+                    # is not finished work. Push the model back to its test
+                    # command instead of accepting an optimistic summary.
                     if require_verification and unverified and nudges_left > 0:
                         nudges_left -= 1
                         hint = (
@@ -306,18 +369,12 @@ class AgentLoop:
                             if last_failed_command
                             else VERIFY_HINT.format(changed=len(set(changed)))
                         )
-                        self.callbacks.emit("on_tool_start", call)
-                        self.callbacks.emit(
-                            "on_tool_result",
+                        self._refuse_finish(
                             call,
-                            ToolResult(
-                                False,
-                                error="finish refused: the changes have not been verified yet",
-                                title="finish (blocked)",
-                            ),
+                            "finish refused: the changes have not been verified yet",
+                            hint,
+                            "Verification required before finishing",
                         )
-                        self.callbacks.emit("on_status", "Verification required before finishing")
-                        self.history.append(ChatMessage.user(hint))
                         consecutive_failures = 0
                         continue
 
@@ -325,6 +382,18 @@ class AgentLoop:
                         summary += (
                             "\n\n> Warning: Agent3 could not confirm these changes - "
                             "no verification command succeeded after the last edit."
+                        )
+                    if broken:
+                        summary += (
+                            "\n\n> Warning: these file(s) still contain syntax errors: "
+                            + ", ".join(sorted(broken))
+                        )
+                    live = self._running_processes()
+                    if live:
+                        summary += (
+                            "\n\n> Note: background process(es) still running: "
+                            + ", ".join(live)
+                            + " - use the terminal panel to stop them."
                         )
                     result.stop_reason = AgentStopReason.FINISHED
                     result.final_message = summary
@@ -356,6 +425,17 @@ class AgentLoop:
                 else:
                     consecutive_failures += 1
                     self.usage.record_error(tool_result.error, where=f"tool:{call.name}")
+
+                # Track files the auto-checker found broken, and clear the
+                # flag as soon as the same file parses again.
+                syntax = tool_result.data.get("syntax")
+                if isinstance(syntax, dict) and syntax.get("checked"):
+                    syntax_path = str(syntax.get("path") or "")
+                    if syntax_path:
+                        if syntax.get("ok"):
+                            broken.pop(syntax_path, None)
+                        else:
+                            broken[syntax_path] = tool_result.error or tool_result.output
 
                 # Track what still needs proving.
                 if tool_result.ok and call.name in mutating:
@@ -399,7 +479,8 @@ class AgentLoop:
         result.duration_ms = int((time.monotonic() - started) * 1000)
         result.transcript = list(self.history)
         result.changed_files = sorted(set(changed))
-        result.verified = bool(changed) and not unverified
+        result.verified = bool(changed) and not unverified and not broken
+        result.broken_files = sorted(broken)
         result.verification_command = verified_with
         if not result.final_message:
             result.final_message = self._fallback_message(result)
@@ -412,6 +493,27 @@ class AgentLoop:
             result.total_tokens,
         )
         return result
+
+    def _refuse_finish(self, call: ToolCall, reason: str, hint: str, status: str) -> None:
+        """Reject a premature ``finish`` and feed the model a repair hint."""
+        self.callbacks.emit("on_tool_start", call)
+        self.callbacks.emit(
+            "on_tool_result",
+            call,
+            ToolResult(False, error=reason, title="finish (blocked)"),
+        )
+        self.callbacks.emit("on_status", status)
+        self.history.append(ChatMessage.user(hint))
+
+    def _running_processes(self) -> List[str]:
+        """Ids of background processes the agent left running."""
+        manager = self.context.processes
+        if manager is None:
+            return []
+        try:
+            return [info.process_id for info in manager.list(running_only=True)]
+        except Exception:  # pragma: no cover - defensive
+            return []
 
     @staticmethod
     def _fallback_message(result: AgentRunResult) -> str:

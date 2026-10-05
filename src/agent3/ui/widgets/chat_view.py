@@ -10,10 +10,12 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSizePolicy,
     QTextBrowser,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -290,6 +292,74 @@ class ActionCard(QFrame):
             self._toggle.setText("Diff" if is_diff else "Details")
 
 
+class ThinkingBlock(QFrame):
+    """Collapsible panel holding the model's reasoning trace.
+
+    Ollama streams reasoning in a separate ``message.thinking`` field, so it
+    can be shown without polluting the answer. It is collapsed by default -
+    it is context for the curious, not the result.
+    """
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("ThinkingBlock")
+        self.setStyleSheet(
+            f"""
+            QFrame#ThinkingBlock {{
+                background-color: {COLORS.panel};
+                border: 1px dashed {COLORS.border};
+                border-radius: 8px;
+            }}
+            """
+        )
+        self._text = ""
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 6, 12, 8)
+        layout.setSpacing(4)
+
+        self.toggle = QToolButton()
+        self.toggle.setCheckable(True)
+        self.toggle.setChecked(False)
+        self.toggle.setArrowType(Qt.ArrowType.RightArrow)
+        self.toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.toggle.setText("Reasoning")
+        self.toggle.setStyleSheet(
+            f"QToolButton {{ color: {COLORS.purple}; border: none; font-weight: 600; }}"
+        )
+        self.toggle.toggled.connect(self._on_toggle)
+        layout.addWidget(self.toggle, 0, Qt.AlignmentFlag.AlignLeft)
+
+        self.body = QPlainTextEdit()
+        self.body.setReadOnly(True)
+        self.body.setFrameShape(QFrame.Shape.NoFrame)
+        self.body.setFont(mono_font(9))
+        self.body.setVisible(False)
+        self.body.setMaximumHeight(240)
+        self.body.setStyleSheet(
+            f"QPlainTextEdit {{ background-color: transparent; color: {COLORS.text_dim};"
+            f" border: none; }}"
+        )
+        layout.addWidget(self.body)
+
+    def append(self, delta: str) -> None:
+        self._text += delta
+        self.body.setPlainText(self._text)
+        self.body.verticalScrollBar().setValue(self.body.verticalScrollBar().maximum())
+        words = len(self._text.split())
+        self.toggle.setText(f"Reasoning · {words} word(s)")
+
+    @property
+    def text(self) -> str:
+        return self._text
+
+    def _on_toggle(self, checked: bool) -> None:
+        self.body.setVisible(checked)
+        self.toggle.setArrowType(
+            Qt.ArrowType.DownArrow if checked else Qt.ArrowType.RightArrow
+        )
+
+
 class ChatView(QScrollArea):
     """Scrollable transcript of bubbles and action cards."""
 
@@ -308,6 +378,7 @@ class ChatView(QScrollArea):
         self.setWidget(self._container)
 
         self._streaming: Optional[MessageBubble] = None
+        self._thinking: Optional[ThinkingBlock] = None
 
     # -------------------------------------------------------------- items
     def _insert(self, widget: QWidget) -> None:
@@ -336,6 +407,36 @@ class ChatView(QScrollArea):
         return label
 
     # ---------------------------------------------------------- streaming
+    def begin_thinking(self) -> "ThinkingBlock":
+        """Open a reasoning block for the step that is starting."""
+        block = ThinkingBlock()
+        self._insert(block)
+        self._thinking = block
+        return block
+
+    def append_thinking_delta(self, delta: str) -> None:
+        """Stream a reasoning fragment into the current block."""
+        if not delta:
+            return
+        if self._thinking is None:
+            self.begin_thinking()
+        assert self._thinking is not None
+        self._thinking.append(delta)
+        self.scroll_to_bottom()
+
+    def end_thinking(self) -> None:
+        """Close the reasoning block; drop it when nothing was emitted."""
+        if self._thinking is None:
+            return
+        if not self._thinking.text.strip():
+            self._thinking.setParent(None)
+            self._thinking.deleteLater()
+        self._thinking = None
+
+    @property
+    def thinking_text(self) -> str:
+        return self._thinking.text if self._thinking is not None else ""
+
     def begin_assistant_stream(self) -> MessageBubble:
         self._streaming = self.add_message("assistant", "")
         return self._streaming
@@ -356,6 +457,7 @@ class ChatView(QScrollArea):
             self._streaming.setParent(None)
             self._streaming.deleteLater()
         self._streaming = None
+        self.end_thinking()
 
     @property
     def is_streaming(self) -> bool:
@@ -370,6 +472,7 @@ class ChatView(QScrollArea):
                 widget.setParent(None)
                 widget.deleteLater()
         self._streaming = None
+        self._thinking = None
 
     def scroll_to_bottom(self) -> None:
         bar = self.verticalScrollBar()

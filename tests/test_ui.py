@@ -316,3 +316,264 @@ class TestActionCardDetails:
         card.set_status("blocked", "4 ms")
         assert card._icon.text() == "!"
         assert "blocked" not in card._subtitle.text()
+
+
+# ==================================================== composer control strip
+GPT_OSS_SHOW = {
+    "capabilities": ["completion", "tools", "thinking"],
+    "thinking": {"values": ["low", "medium", "high"], "default": "medium"},
+}
+QWEN_SHOW = {
+    "capabilities": ["completion", "thinking"],
+    "thinking": {"values": [True, False], "default": True},
+}
+PLAIN_SHOW = {"capabilities": ["completion"]}
+
+
+def _support(model, payload):
+    from agent3.llm.ollama_client import ThinkingSupport
+
+    return ThinkingSupport.from_show(model, payload)
+
+
+class TestComposerBar:
+    def test_model_picker_lives_here(self, qapp):
+        from agent3.ui.widgets.composer_bar import ComposerBar
+
+        bar = ComposerBar()
+        bar.set_models(["a:1", "b:2"], "b:2")
+        assert bar.current_model() == "b:2"
+        assert bar.available_models() == ["a:1", "b:2"]
+
+    def test_model_change_is_emitted(self, qapp):
+        from agent3.ui.widgets.composer_bar import ComposerBar
+
+        bar = ComposerBar()
+        seen = []
+        bar.model_changed.connect(seen.append)
+        bar.model_box.setEditText("qwen3:8b")
+        assert seen and seen[-1] == "qwen3:8b"
+
+    def test_programmatic_model_set_is_silent(self, qapp):
+        from agent3.ui.widgets.composer_bar import ComposerBar
+
+        bar = ComposerBar()
+        seen = []
+        bar.model_changed.connect(seen.append)
+        bar.set_models(["x:1"], "x:1")
+        assert seen == []
+
+    def test_levels_come_from_the_server(self, qapp):
+        from agent3.ui.widgets.composer_bar import ComposerBar
+
+        bar = ComposerBar()
+        bar.set_thinking_support(_support("gpt-oss:20b", GPT_OSS_SHOW))
+        labels = [bar.level_box.itemText(i) for i in range(bar.level_box.count())]
+        assert labels == ["Auto", "Low", "Medium", "High"]
+
+    def test_level_only_model_cannot_switch_thinking_off(self, qapp):
+        from agent3.ui.widgets.composer_bar import ComposerBar
+
+        bar = ComposerBar()
+        bar.set_thinking_support(_support("gpt-oss:20b", GPT_OSS_SHOW))
+        assert bar.think_toggle.isChecked() is True
+        assert bar.think_toggle.isEnabled() is False
+
+    def test_boolean_model_hides_the_level_picker(self, qapp):
+        from agent3.ui.widgets.composer_bar import ComposerBar
+
+        bar = ComposerBar()
+        bar.set_thinking_support(_support("qwen3:8b", QWEN_SHOW))
+        assert bar.think_toggle.isEnabled() is True
+        assert bar.level_box.isHidden() is True
+
+    def test_model_without_reasoning_disables_everything(self, qapp):
+        from agent3.ui.widgets.composer_bar import ComposerBar
+
+        bar = ComposerBar()
+        bar.set_thinking_support(_support("llama3.1:8b", PLAIN_SHOW))
+        assert bar.think_toggle.isEnabled() is False
+        assert bar.think_toggle.isChecked() is False
+        assert bar.level_box.isHidden() is True
+        assert bar.capability_label.text() == "no reasoning"
+
+    def test_selecting_a_level_emits_that_exact_value(self, qapp):
+        from agent3.ui.widgets.composer_bar import ComposerBar
+
+        bar = ComposerBar()
+        bar.set_thinking_support(_support("gpt-oss:20b", GPT_OSS_SHOW))
+        seen = []
+        bar.think_changed.connect(seen.append)
+        bar.level_box.setCurrentIndex(bar.level_box.findData("low"))
+        assert seen == ["low"]
+        assert bar.think_spec() == "low"
+
+    def test_toggling_off_emits_off(self, qapp):
+        from agent3.ui.widgets.composer_bar import ComposerBar
+
+        bar = ComposerBar()
+        bar.set_thinking_support(_support("qwen3:8b", QWEN_SHOW), "on")
+        seen = []
+        bar.think_changed.connect(seen.append)
+        bar.think_toggle.setChecked(False)
+        assert seen == ["off"]
+
+    def test_unsupported_spec_is_reset_when_the_model_changes(self, qapp):
+        from agent3.ui.widgets.composer_bar import ComposerBar
+
+        bar = ComposerBar()
+        bar.set_thinking_support(_support("gpt-oss:20b", GPT_OSS_SHOW), "high")
+        assert bar.think_spec() == "high"
+        bar.set_thinking_support(_support("qwen3:8b", QWEN_SHOW))
+        assert bar.think_spec() == "auto"  # qwen3 has no "high"
+
+    def test_summary_text_describes_the_setting(self, qapp):
+        from agent3.ui.widgets.composer_bar import ComposerBar
+
+        bar = ComposerBar()
+        bar.set_thinking_support(_support("gpt-oss:20b", GPT_OSS_SHOW), "medium")
+        assert bar.thinking_summary() == "reasoning: medium"
+
+    def test_connection_badge(self, qapp):
+        from agent3.ui.widgets.composer_bar import ComposerBar
+
+        bar = ComposerBar()
+        bar.set_connection(True, "online · http://localhost:11435")
+        assert "online" in bar.connection_label.text()
+        bar.set_connection(False, "offline")
+        assert "offline" in bar.connection_label.text()
+
+    def test_busy_locks_the_controls(self, qapp):
+        from agent3.ui.widgets.composer_bar import ComposerBar
+
+        bar = ComposerBar()
+        bar.set_thinking_support(_support("qwen3:8b", QWEN_SHOW))
+        bar.set_busy(True)
+        assert bar.model_box.isEnabled() is False
+        bar.set_busy(False)
+        assert bar.model_box.isEnabled() is True
+
+
+# ================================================================ plan panel
+class TestTaskPanel:
+    def test_empty_state(self, qapp):
+        from agent3.ui.widgets.task_panel import TaskPanel
+
+        panel = TaskPanel()
+        assert panel.list.isHidden() is True
+        assert panel._empty.isHidden() is False
+
+    def test_tasks_are_listed_with_progress(self, qapp):
+        from agent3.agent.tasks import TaskList
+        from agent3.ui.widgets.task_panel import TaskPanel
+
+        tasks = TaskList()
+        tasks.add("one", task_id="one", status="completed")
+        tasks.add("two", task_id="two", status="in_progress")
+        tasks.add("three", task_id="three")
+
+        panel = TaskPanel()
+        panel.set_tasks(list(tasks))
+        assert panel.list.count() == 3
+        assert panel._counter.text() == "1/3"
+        assert panel._bar.value() == 33
+        assert panel.task_ids() == ["one", "two", "three"]
+
+    def test_glyphs_reflect_status(self, qapp):
+        from agent3.agent.tasks import TaskList
+        from agent3.ui.widgets.task_panel import TaskPanel
+
+        tasks = TaskList()
+        tasks.add("done", task_id="d", status="completed")
+        tasks.add("doing", task_id="i", status="in_progress")
+        panel = TaskPanel()
+        panel.set_tasks(list(tasks))
+        assert panel.list.item(0).text().startswith("✓")
+        assert panel.list.item(1).text().startswith("◐")
+        assert panel.list.item(1).font().bold() is True
+
+    def test_clear_returns_to_empty(self, qapp):
+        from agent3.agent.tasks import TaskList
+        from agent3.ui.widgets.task_panel import TaskPanel
+
+        tasks = TaskList()
+        tasks.add("x", task_id="x")
+        panel = TaskPanel()
+        panel.set_tasks(list(tasks))
+        panel.clear()
+        assert panel.list.count() == 0
+        assert panel._empty.isHidden() is False
+
+
+# ========================================================== reasoning block
+class TestThinkingBlock:
+    def test_collapsed_by_default(self, qapp):
+        from agent3.ui.widgets.chat_view import ThinkingBlock
+
+        block = ThinkingBlock()
+        assert block.toggle.isChecked() is False
+        assert block.body.isHidden() is True
+
+    def test_streaming_updates_the_word_count(self, qapp):
+        from agent3.ui.widgets.chat_view import ThinkingBlock
+
+        block = ThinkingBlock()
+        block.append("one two ")
+        block.append("three")
+        assert block.text == "one two three"
+        assert "3 word(s)" in block.toggle.text()
+
+    def test_expanding_reveals_the_trace(self, qapp):
+        from agent3.ui.widgets.chat_view import ThinkingBlock
+
+        block = ThinkingBlock()
+        block.append("reasoning text")
+        block.toggle.setChecked(True)
+        assert block.body.isHidden() is False
+        assert "reasoning text" in block.body.toPlainText()
+
+    def test_chat_view_streams_into_a_block(self, qapp):
+        from agent3.ui.widgets.chat_view import ChatView, ThinkingBlock
+
+        chat = ChatView()
+        chat.append_thinking_delta("thinking out loud")
+        assert chat.thinking_text == "thinking out loud"
+        chat.end_thinking()
+        assert chat.thinking_text == ""
+
+    def test_empty_block_is_discarded(self, qapp):
+        from agent3.ui.widgets.chat_view import ChatView
+
+        chat = ChatView()
+        chat.begin_thinking()
+        before = chat._layout.count()
+        chat.end_thinking()
+        assert chat._layout.count() == before - 1
+
+    def test_ending_the_answer_closes_the_reasoning(self, qapp):
+        from agent3.ui.widgets.chat_view import ChatView
+
+        chat = ChatView()
+        chat.append_thinking_delta("because")
+        chat.append_assistant_delta("answer")
+        chat.end_assistant_stream()
+        assert chat._thinking is None
+
+
+# ============================================== terminal background badge
+class TestProcessBadge:
+    def test_hidden_when_nothing_runs(self, qapp):
+        from agent3.ui.widgets.terminal_panel import TerminalPanel
+
+        panel = TerminalPanel()
+        panel.set_process_count(0)
+        assert panel._process_badge.isHidden() is True
+        assert panel.process_count_text() == ""
+
+    def test_shows_the_count(self, qapp):
+        from agent3.ui.widgets.terminal_panel import TerminalPanel
+
+        panel = TerminalPanel()
+        panel.set_process_count(3)
+        assert panel._process_badge.isHidden() is False
+        assert "3 background" in panel._process_badge.text()

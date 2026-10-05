@@ -69,6 +69,14 @@ class OllamaSettings:
     num_predict: int = 4096
     stop: List[str] = field(default_factory=list)
     extra_headers: Dict[str, str] = field(default_factory=dict)
+    #: Reasoning control sent as Ollama's ``think`` field. ``"auto"`` omits it
+    #: (model default), ``"off"``/``"on"`` send booleans, and a level name such
+    #: as ``"low"``/``"medium"``/``"high"`` is forwarded verbatim. The value is
+    #: validated against ``/api/show`` before it reaches the wire, so an
+    #: unsupported setting is silently dropped rather than failing the request.
+    think: str = "auto"
+    #: Show the reasoning trace in the chat transcript when the model emits one.
+    show_thinking: bool = True
 
     @property
     def base_url(self) -> str:
@@ -122,6 +130,19 @@ class AgentSettings:
     #: Seconds of silence after a prompt-looking line before the command is
     #: treated as "waiting for input".
     interactive_idle_seconds: float = 15.0
+    #: Parse/lint every file the agent writes and append the verdict to the
+    #: tool result, so a syntax error is seen in the step that caused it.
+    auto_syntax_check: bool = True
+    #: Also run external linters (eslint/tsc/ruff) when they are installed.
+    run_external_linters: bool = True
+    #: Concurrently running background processes allowed per session.
+    max_background_processes: int = 8
+    #: Log lines retained per background process.
+    process_log_lines: int = 2000
+    #: How many pre-mutation file snapshots the undo buffer keeps.
+    snapshot_history: int = 80
+    #: Let the model keep a visible plan via ``manage_tasks``.
+    enable_task_list: bool = True
     blocked_command_patterns: List[str] = field(
         default_factory=lambda: [
             r"rm\s+-rf\s+/",

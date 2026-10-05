@@ -80,6 +80,15 @@ class TerminalPanel(QWidget):
         self._cwd_label.setStyleSheet(f"color: {COLORS.text_faint};")
         bar_layout.addWidget(self._cwd_label, 1)
 
+        #: Count of background processes the agent started and never stopped.
+        self._process_badge = QLabel("")
+        self._process_badge.setVisible(False)
+        self._process_badge.setStyleSheet(
+            f"color: {COLORS.warning}; background-color: {COLORS.panel_alt};"
+            f" border: 1px solid {COLORS.border}; border-radius: 9px; padding: 1px 8px;"
+        )
+        bar_layout.addWidget(self._process_badge, 0)
+
         self._stop_button = QPushButton("Stop")
         self._stop_button.setObjectName("Danger")
         self._stop_button.setEnabled(False)
@@ -121,6 +130,19 @@ class TerminalPanel(QWidget):
         layout.addLayout(input_row)
 
     # -------------------------------------------------------------- setup
+    def set_process_count(self, count: int) -> None:
+        """Show ``N running`` in the title bar for background processes."""
+        count = max(0, int(count))
+        self._process_badge.setVisible(count > 0)
+        if count:
+            self._process_badge.setText(f"● {count} background")
+            self._process_badge.setToolTip(
+                f"{count} background process(es) started by the agent are still running"
+            )
+
+    def process_count_text(self) -> str:
+        return self._process_badge.text() if self._process_badge.isVisible() else ""
+
     def set_runner(self, runner: Optional[CommandRunner]) -> None:
         self._runner = runner
         self._cwd_label.setText(str(runner.cwd) if runner else "no workspace mounted")

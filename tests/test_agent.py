@@ -21,14 +21,32 @@ from conftest import skip_without_git
 class FakeClient:
     """Replays a scripted list of assistant messages."""
 
-    def __init__(self, responses: Sequence[str]):
+    def __init__(self, responses: Sequence[str], thinking: str = ""):
         self._responses = list(responses)
         self.calls: List[List[ChatMessage]] = []
-        self.settings = type("S", (), {"model": "fake-model"})()
+        self.settings = type("S", (), {"model": "fake-model", "think": "auto"})()
+        self.last_thinking = ""
+        self.think_values: List[object] = []
+        self._thinking = thinking
 
-    def chat(self, messages, *, model=None, options=None, cancel=None, on_delta=None, format_json=False):
+    def chat(
+        self,
+        messages,
+        *,
+        model=None,
+        options=None,
+        cancel=None,
+        on_delta=None,
+        format_json=False,
+        think=None,
+        on_thinking=None,
+    ):
         self.calls.append(list(messages))
+        self.think_values.append(think)
         text = self._responses.pop(0) if self._responses else '```json\n{"tool":"finish","args":{"summary":"done"}}\n```'
+        self.last_thinking = self._thinking
+        if self._thinking and on_thinking:
+            on_thinking(self._thinking)
         if on_delta:
             on_delta(text)
         return text, Usage(prompt_tokens=10, completion_tokens=5, total_duration_ms=50)
@@ -467,3 +485,185 @@ class TestSessionStore:
         markdown = store.export_markdown(session.id)
         assert "# Export me" in markdown and "question" in markdown
         store.close()
+
+
+class TestRuntimeGates:
+    """The loop refuses to finish on broken code or an unfinished plan."""
+
+    def build(self, responses, usage_manager, tool_context, **settings):
+        client = FakeClient(responses)
+        loop = AgentLoop(
+            client,
+            ToolRegistry(),
+            tool_context,
+            usage_manager,
+            AgentSettings(max_iterations=settings.pop("max_iterations", 10), **settings),
+            model="fake-model",
+        )
+        return client, loop
+
+    # ----------------------------------------------------------- syntax
+    def test_finish_is_refused_while_a_file_is_broken(self, usage_manager, tool_context):
+        _client, loop = self.build(
+            [
+                tool_block("write_file", path="broken.py", content="def f(:\n"),
+                tool_block("finish", summary="Done!"),
+                tool_block("write_file", path="broken.py", content="def f():\n    return 1\n"),
+                tool_block("run_command", command="python -c \"print(1)\""),
+                tool_block("finish", summary="Fixed and verified"),
+            ],
+            usage_manager,
+            tool_context,
+        )
+        result = loop.run("write broken.py")
+        assert result.stop_reason is AgentStopReason.FINISHED
+        assert result.final_message == "Fixed and verified"
+        assert result.broken_files == []
+        assert any("SYNTAX" in m.content for m in loop.history if m.role is Role.USER)
+
+    def test_broken_file_is_reported_when_the_model_insists(self, usage_manager, tool_context):
+        _client, loop = self.build(
+            [
+                tool_block("write_file", path="broken.py", content="def f(:\n"),
+                tool_block("finish", summary="Done"),
+                tool_block("finish", summary="Done"),
+                tool_block("finish", summary="Done"),
+                tool_block("finish", summary="Done"),
+            ],
+            usage_manager,
+            tool_context,
+            require_verification=False,
+        )
+        result = loop.run("write broken.py")
+        assert result.stop_reason is AgentStopReason.FINISHED
+        assert result.broken_files == ["broken.py"]
+        assert "syntax errors" in result.final_message
+        assert result.verified is False
+
+    def test_a_clean_write_passes_the_syntax_gate(self, usage_manager, tool_context):
+        _client, loop = self.build(
+            [
+                tool_block("write_file", path="fine.py", content="x = 1\n"),
+                tool_block("finish", summary="Done"),
+            ],
+            usage_manager,
+            tool_context,
+            require_verification=False,
+        )
+        result = loop.run("write fine.py")
+        assert result.final_message == "Done"
+        assert result.broken_files == []
+
+    # ------------------------------------------------------------ tasks
+    def test_finish_is_refused_while_tasks_are_open(self, usage_manager, tool_context):
+        _client, loop = self.build(
+            [
+                tool_block(
+                    "manage_tasks",
+                    action="add",
+                    tasks=[
+                        {"id": "a", "description": "First step"},
+                        {"id": "b", "description": "Second step"},
+                    ],
+                ),
+                tool_block("finish", summary="All done"),
+                tool_block(
+                    "manage_tasks",
+                    action="update",
+                    tasks=[{"id": "a", "status": "completed"}, {"id": "b", "status": "completed"}],
+                ),
+                tool_block("finish", summary="All done for real"),
+            ],
+            usage_manager,
+            tool_context,
+            require_verification=False,
+        )
+        result = loop.run("do two things")
+        assert result.final_message == "All done for real"
+        assert tool_context.tasks.all_done
+        assert any("plan still has open items" in m.content for m in loop.history
+                   if m.role is Role.USER)
+
+    def test_a_single_task_does_not_block_finishing(self, usage_manager, tool_context):
+        _client, loop = self.build(
+            [
+                tool_block("manage_tasks", action="add", tasks=[{"id": "a", "description": "A"}]),
+                tool_block("finish", summary="Done"),
+            ],
+            usage_manager,
+            tool_context,
+            require_verification=False,
+        )
+        assert loop.run("one thing").final_message == "Done"
+
+    def test_no_plan_means_no_gate(self, usage_manager, tool_context):
+        _client, loop = self.build(
+            [tool_block("finish", summary="Nothing to do")],
+            usage_manager,
+            tool_context,
+            require_verification=False,
+        )
+        assert loop.run("hello").final_message == "Nothing to do"
+
+    def test_task_changes_reach_the_callback(self, usage_manager, tool_context):
+        seen = []
+        _client, loop = self.build(
+            [
+                tool_block("manage_tasks", action="add", tasks=["step one"]),
+                tool_block("finish", summary="Done"),
+            ],
+            usage_manager,
+            tool_context,
+            require_verification=False,
+        )
+        loop.callbacks = AgentCallbacks(on_tasks_changed=seen.append)
+        loop.context.on_tasks_changed = loop.callbacks.on_tasks_changed
+        loop.run("plan it")
+        assert len(seen) == 1
+
+    # ---------------------------------------------------------- thinking
+    def test_think_spec_is_forwarded_to_the_client(self, usage_manager, tool_context):
+        client, loop = self.build(
+            [tool_block("finish", summary="ok")], usage_manager, tool_context
+        )
+        loop.think = "high"
+        loop.run("hi")
+        assert client.think_values == ["high"]
+
+    def test_reasoning_is_streamed_and_kept_off_the_answer(self, usage_manager, tool_context):
+        client = FakeClient([tool_block("finish", summary="ok")], thinking="let me think")
+        loop = AgentLoop(
+            client,
+            ToolRegistry(),
+            tool_context,
+            usage_manager,
+            AgentSettings(max_iterations=4),
+            model="fake-model",
+        )
+        thoughts = []
+        loop.callbacks = AgentCallbacks(on_thinking_delta=thoughts.append)
+        result = loop.run("hi")
+        assert thoughts == ["let me think"]
+        assert result.thinking == "let me think"
+        assert "let me think" not in result.final_message
+
+    # --------------------------------------------------------- processes
+    def test_background_processes_are_flagged_in_the_summary(
+        self, usage_manager, tool_context
+    ):
+        class _FakeInfo:
+            process_id = "proc-1"
+
+        class _FakeManager:
+            def list(self, running_only=False):
+                return [_FakeInfo()]
+
+        tool_context.processes = _FakeManager()
+        _client, loop = self.build(
+            [tool_block("finish", summary="Done")],
+            usage_manager,
+            tool_context,
+            require_verification=False,
+        )
+        result = loop.run("start a server")
+        assert "proc-1" in result.final_message
