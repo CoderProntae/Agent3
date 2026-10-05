@@ -149,9 +149,27 @@ class SettingsDialog(QDialog):
         self._show_thinking = QCheckBox("Show the reasoning trace in the chat transcript")
         self._show_thinking.setToolTip(
             "Thinking models return their reasoning in a separate field. The effort level "
-            "itself is chosen under the message box, from the values the model reports."
+            "itself is chosen under the message box, from the values the model really "
+            "accepts - read from the server's metadata or from the chat template."
         )
         transport.addRow("", self._show_thinking)
+
+        self._strip_inline_reasoning = QCheckBox(
+            "Move inline <think> blocks out of the answer"
+        )
+        self._strip_inline_reasoning.setToolTip(
+            "Some servers return the reasoning trace inside the answer instead of its "
+            "own field. Leave this on so the scratchpad never reaches the tool parser."
+        )
+        transport.addRow("", self._strip_inline_reasoning)
+
+        self._enforce_think = QCheckBox("Restate the reasoning setting in the prompt")
+        self._enforce_think.setToolTip(
+            "Ollama does not forward the think field into every chat template, so a "
+            "model told not to reason often reasons anyway. When this is on, the same "
+            "instruction the template would have used is added to the conversation."
+        )
+        transport.addRow("", self._enforce_think)
 
         self._temperature = QDoubleSpinBox()
         self._temperature.setRange(0.0, 2.0)
@@ -324,6 +342,8 @@ class SettingsDialog(QDialog):
         self._num_ctx.setValue(int(ollama.num_ctx))
         self._num_predict.setValue(int(ollama.num_predict))
         self._show_thinking.setChecked(bool(ollama.show_thinking))
+        self._strip_inline_reasoning.setChecked(bool(ollama.strip_inline_reasoning))
+        self._enforce_think.setChecked(bool(ollama.enforce_think_in_prompt))
 
         agent = config.agent
         self._max_iterations.setValue(int(agent.max_iterations))
@@ -372,6 +392,8 @@ class SettingsDialog(QDialog):
         ollama.num_ctx = int(self._num_ctx.value())
         ollama.num_predict = int(self._num_predict.value())
         ollama.show_thinking = bool(self._show_thinking.isChecked())
+        ollama.strip_inline_reasoning = bool(self._strip_inline_reasoning.isChecked())
+        ollama.enforce_think_in_prompt = bool(self._enforce_think.isChecked())
 
         agent = config.agent
         agent.max_iterations = int(self._max_iterations.value())

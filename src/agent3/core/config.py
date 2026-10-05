@@ -77,6 +77,17 @@ class OllamaSettings:
     think: str = "auto"
     #: Show the reasoning trace in the chat transcript when the model emits one.
     show_thinking: bool = True
+    #: Move ``<think>`` style blocks out of the answer and into the reasoning
+    #: channel. Needed for models whose server returns the trace inline in
+    #: ``message.content`` instead of the dedicated ``message.thinking`` field;
+    #: without it the scratchpad reaches the tool-call parser.
+    strip_inline_reasoning: bool = True
+    #: Also state the reasoning setting in the prompt when the server does not
+    #: report native ``thinking`` metadata. Ollama does not forward ``think``
+    #: into every chat template, so templates that default to "always reason"
+    #: ignore the request field unless the instruction is repeated in the
+    #: conversation itself.
+    enforce_think_in_prompt: bool = True
 
     @property
     def base_url(self) -> str:

@@ -19,7 +19,7 @@ import json
 import random
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence
 
 import requests
@@ -27,7 +27,17 @@ from requests.adapters import HTTPAdapter
 
 from agent3.core.config import OllamaSettings
 from agent3.core.logging_setup import get_logger
-from agent3.llm.messages import ChatMessage, StreamEvent, Usage
+from agent3.llm.messages import ChatMessage, Role, StreamEvent, Usage
+from agent3.llm.reasoning import (
+    SOFT_SWITCH_OFF,
+    PromptControls,
+    level_label,
+    ReasoningFilter,
+    TemplateControls,
+    parse_template_controls,
+    prompt_controls,
+    split_inline_reasoning,
+)
 from agent3.llm.tokenizer import count_message_tokens, estimate_tokens
 
 logger = get_logger(__name__)
@@ -41,26 +51,37 @@ THINK_OFF = "off"
 #: ``think`` spec meaning "reason" (sends ``think: true``).
 THINK_ON = "on"
 
-#: Levels Ollama's API layer validates even without per-model metadata.
+#: Values Ollama's API layer accepts in the ``think`` field. Used only to
+#: sanity-check a level that came from somewhere else - never as a menu.
 KNOWN_THINK_LEVELS = ("low", "medium", "high", "max")
 
-#: Last-resort level sets for models whose server reports no metadata.
-#: Only families whose documented behaviour is unambiguous are listed; the
-#: live ``/api/show`` response always wins over this table.
-FAMILY_THINK_LEVELS: Dict[str, tuple[str, ...]] = {
-    "gpt-oss": ("low", "medium", "high"),
-}
+#: Where a model's reasoning capability was established, worst to best.
+SOURCE_NONE = "none"
+SOURCE_CAPABILITY = "capability"
+SOURCE_TEMPLATE = "template"
+SOURCE_METADATA = "metadata"
 
 
 @dataclass(frozen=True)
 class ThinkingSupport:
-    """What a specific model accepts in the ``think`` request field.
+    """What a specific model really accepts in the ``think`` request field.
 
-    Populated from ``/api/show``, which returns a top level ``thinking``
-    object such as ``{"values": ["low", "medium", "high"], "default": "medium"}``.
-    ``values`` may mix booleans and model-defined level names; ``[false]``
-    means the model cannot think at all. When the key is absent the server
-    told us nothing, and :attr:`known` stays ``False``.
+    Established from the server, never from the model's name, in this order:
+
+    1. ``/api/show`` → ``thinking: {"values": [...], "default": ...}``.
+       Authoritative: the server itself will honour the ``think`` field.
+    2. The model's **chat template**, also returned by ``/api/show``. A GGUF
+       repack usually carries its controls there - ``enable_thinking`` for
+       on/off, ``reasoning_effort`` validated against a literal tuple such as
+       ``('xhigh', 'medium', 'low')`` for the levels. These are the real
+       values *this file* accepts, whatever the model is called.
+    3. ``capabilities`` containing ``"thinking"`` → on/off only.
+    4. Nothing → the model does not reason.
+
+    Only case 1 is delivered natively by the server. In cases 2 and 3 the
+    setting has to be reproduced in the prompt (see
+    :mod:`agent3.llm.reasoning`), because the ``think`` field is frequently
+    dropped before it reaches the template.
     """
 
     model: str = ""
@@ -68,34 +89,71 @@ class ThinkingSupport:
     default: Any = None
     capabilities: tuple[str, ...] = ()
     known: bool = False
+    #: One of ``metadata`` / ``template`` / ``capability`` / ``none``.
+    source: str = SOURCE_NONE
+    #: Reasoning knobs found in the chat template (empty when unused).
+    controls: TemplateControls = field(default_factory=TemplateControls)
 
+    # -------------------------------------------------------------- shape
     @property
     def levels(self) -> tuple[str, ...]:
-        """Named levels (``low``/``medium``/...) the model understands."""
+        """Named levels (``low``/``xhigh``/...) the model understands."""
         return tuple(str(v) for v in self.values if isinstance(v, str))
 
     @property
     def can_enable(self) -> bool:
-        """True when thinking can be switched on at all."""
         return bool(self.levels) or True in self.values
 
     @property
     def can_disable(self) -> bool:
-        """True when the trace can be suppressed (gpt-oss cannot)."""
-        return False in self.values or not self.known
+        """True when the trace can be suppressed at all."""
+        if self.source == SOURCE_METADATA:
+            return False in self.values
+        if self.source == SOURCE_TEMPLATE:
+            # A template with an on/off knob can always be turned off, even
+            # if the knob only works through the prompt.
+            return self.controls.has_switch or self.controls.soft_switch
+        return self.supported
 
     @property
     def supported(self) -> bool:
-        """True when this model can produce a reasoning trace."""
+        if self.source == SOURCE_NONE:
+            return False
         if self.known:
             return self.can_enable
-        return "thinking" in self.capabilities
+        return True
 
     @property
     def forced(self) -> bool:
-        """True when the model always thinks and cannot be turned off."""
-        return self.supported and self.known and not self.can_disable
+        """True when the model always reasons and cannot be turned off."""
+        return self.supported and not self.can_disable
 
+    @property
+    def native(self) -> bool:
+        """True when the server honours ``think`` on its own."""
+        return self.source == SOURCE_METADATA
+
+    @property
+    def needs_prompt_enforcement(self) -> bool:
+        """True when the setting has to be restated in the prompt."""
+        return self.supported and not self.native
+
+    @property
+    def thinks_by_default(self) -> bool:
+        """True when the model reasons unless actively told not to."""
+        if self.source == SOURCE_METADATA:
+            return self.default not in (None, False)
+        return self.controls.thinking_is_default or bool(self.levels)
+
+    def source_label(self) -> str:
+        return {
+            SOURCE_METADATA: "reported by the server",
+            SOURCE_TEMPLATE: "read from the chat template",
+            SOURCE_CAPABILITY: "capability flag only",
+            SOURCE_NONE: "not supported",
+        }.get(self.source, self.source)
+
+    # ------------------------------------------------------------ choices
     def choices(self) -> List[tuple[str, str]]:
         """``(spec, label)`` pairs for a UI selector - real values only."""
         options: List[tuple[str, str]] = [(THINK_AUTO, "Auto")]
@@ -103,29 +161,25 @@ class ThinkingSupport:
             return options
         if self.can_disable:
             options.append((THINK_OFF, "Off"))
-        if True in self.values or (not self.known and not self.levels):
+        if True in self.values or (not self.levels and self.supported):
             options.append((THINK_ON, "On"))
         for level in self.levels:
-            options.append((level, level.capitalize()))
+            options.append((level, level_label(level)))
         return options
 
     def accepts(self, spec: str) -> bool:
-        """Is *spec* a value this model actually understands?"""
         key = str(spec or "").strip().lower()
         if key in ("", THINK_AUTO):
             return True
         if key == THINK_OFF:
             return self.can_disable
         if key == THINK_ON:
-            return self.supported and (True in self.values or not self.known)
+            return self.supported and (True in self.values or not self.levels)
         return key in {level.lower() for level in self.levels}
 
+    # ------------------------------------------------------------ resolve
     def resolve(self, spec: str) -> Optional[Any]:
-        """Translate a stored spec into the literal ``think`` field value.
-
-        Returns ``None`` when the field must be omitted, which makes Ollama
-        apply the model's own default.
-        """
+        """Translate a stored spec into the literal ``think`` field value."""
         key = str(spec or "").strip().lower()
         if key in ("", THINK_AUTO):
             return None
@@ -134,18 +188,41 @@ class ThinkingSupport:
         if key == THINK_OFF:
             return False if self.can_disable else None
         if key == THINK_ON:
-            if True in self.values or not self.known:
+            if True in self.values or not self.levels:
                 return True
-            # A level-only model (gpt-oss): "on" means its default level.
             if isinstance(self.default, str):
                 return self.default
-            return self.levels[len(self.levels) // 2] if self.levels else None
+            return self.levels[len(self.levels) // 2]
         for level in self.levels:
             if level.lower() == key:
-                return level
-        if not self.known and key in KNOWN_THINK_LEVELS:
-            return key
+                # Levels that Ollama's own API refuses are still useful: they
+                # are delivered through the prompt instead of the field.
+                return level if level.lower() in KNOWN_THINK_LEVELS or self.native else level
         return None
+
+    def intent(self, spec: str) -> tuple[Optional[bool], str]:
+        """Interpret *spec* as ``(thinking_enabled, level)``.
+
+        Used by the prompt-level enforcement path, which needs the user's
+        intention rather than the wire value.
+        """
+        key = str(spec or "").strip().lower()
+        if key in ("", THINK_AUTO):
+            return None, ""
+        if key == THINK_OFF:
+            return False, ""
+        if key == THINK_ON:
+            # On a levels-only model "on" means "the level the template would
+            # have picked for itself", so the instruction text still matches.
+            if self.levels:
+                if isinstance(self.default, str) and self.default in self.levels:
+                    return True, self.default
+                return True, self.levels[0]
+            return True, ""
+        for level in self.levels:
+            if level.lower() == key:
+                return True, level
+        return None, ""
 
     def describe(self) -> str:
         if not self.supported:
@@ -159,14 +236,22 @@ class ThinkingSupport:
             parts.append("always on")
         if self.default is not None:
             parts.append(f"default: {self.default}")
-        return "; ".join(parts) or "thinking supported"
+        parts.append(self.source_label())
+        if self.needs_prompt_enforcement:
+            parts.append("enforced through the prompt")
+        return "; ".join(parts)
 
+    # ------------------------------------------------------------- build
     @classmethod
     def from_show(cls, model: str, data: Dict[str, Any]) -> "ThinkingSupport":
         """Build from an ``/api/show`` response body."""
         capabilities = tuple(
-            str(item) for item in (data.get("capabilities") or []) if isinstance(item, (str, bytes))
+            str(item) for item in (data.get("capabilities") or []) if isinstance(item, str)
         )
+        template = str(data.get("template") or "")
+        controls = parse_template_controls(template)
+
+        # 1. Server-reported metadata wins outright.
         block = data.get("thinking")
         if isinstance(block, dict) and isinstance(block.get("values"), list):
             return cls(
@@ -175,25 +260,49 @@ class ThinkingSupport:
                 default=block.get("default"),
                 capabilities=capabilities,
                 known=True,
+                source=SOURCE_METADATA,
+                controls=controls,
             )
-        # No metadata: fall back to the capability flag plus the family table.
-        family_levels: tuple[str, ...] = ()
-        lowered = model.lower()
-        for family, levels in FAMILY_THINK_LEVELS.items():
-            if family in lowered:
-                family_levels = levels
-                break
-        if family_levels:
+
+        # 2. The chat template is the next most trustworthy source: it is the
+        #    code that will actually run for this exact file.
+        if controls.found_anything:
+            values: List[Any] = []
+            if controls.has_switch or controls.soft_switch:
+                values.append(False)
+            if controls.levels:
+                values.extend(controls.levels)
+            else:
+                values.append(True)
             return cls(
                 model=model,
-                values=family_levels,
-                default=family_levels[len(family_levels) // 2],
+                values=tuple(values),
+                default=controls.default if controls.levels else True,
                 capabilities=capabilities or ("thinking",),
                 known=False,
+                source=SOURCE_TEMPLATE,
+                controls=controls,
             )
+
+        # 3. A bare capability flag: on/off, nothing finer.
         if "thinking" in capabilities:
-            return cls(model=model, values=(True, False), capabilities=capabilities, known=False)
-        return cls(model=model, values=(), capabilities=capabilities, known=False)
+            return cls(
+                model=model,
+                values=(True, False),
+                capabilities=capabilities,
+                known=False,
+                source=SOURCE_CAPABILITY,
+                controls=controls,
+            )
+
+        # 4. No evidence of reasoning at all.
+        return cls(
+            model=model,
+            values=(),
+            capabilities=capabilities,
+            source=SOURCE_NONE,
+            controls=controls,
+        )
 
 
 class OllamaError(RuntimeError):
@@ -224,6 +333,12 @@ class OllamaClient:
         self._thinking_cache: Dict[str, ThinkingSupport] = {}
         #: Reasoning trace produced by the most recent :meth:`chat` call.
         self.last_thinking: str = ""
+        #: True when the last call produced reasoning that arrived inline in
+        #: the answer (``<think>`` tags) rather than in its own field, which
+        #: means the server ignored the ``think`` request field.
+        self.last_reasoning_leaked: bool = False
+        #: True when the last call asked for silence and reasoned anyway.
+        self.last_think_ignored: bool = False
 
     # ------------------------------------------------------------ plumbing
     def _build_session(self) -> requests.Session:
@@ -496,6 +611,83 @@ class OllamaClient:
                 return candidate
         return target
 
+    # ------------------------------------------------------- reasoning plan
+    def think_plan(
+        self, spec: Optional[str], model: Optional[str] = None
+    ) -> tuple[Optional[Any], PromptControls, ThinkingSupport]:
+        """Work out how to deliver a reasoning setting for *model*.
+
+        Returns the literal ``think`` request value (or ``None`` to omit the
+        field), the prompt level instructions needed to make the setting
+        stick, and the support record the decision was based on.
+
+        The prompt level part exists because Ollama does not forward the
+        ``think`` field into the chat template for every model: a template
+        that reads ``enable_thinking``/``reasoning_effort`` never sees it and
+        falls back to its own default, which is usually "reason, at full
+        effort". Restating the instruction in the conversation is the only
+        transport-independent way to be obeyed.
+        """
+        raw = self.settings.think if spec is None else spec
+        key = str(raw or "").strip().lower()
+        if key in ("", THINK_AUTO):
+            # "Auto" means "say nothing at all", so there is no reason to
+            # query the server about a model we are not going to configure.
+            return None, PromptControls(), ThinkingSupport(model=model or "")
+
+        support = self.thinking_support(model)
+        wire = support.resolve(key)
+        controls = PromptControls()
+        if self.settings.enforce_think_in_prompt and support.needs_prompt_enforcement:
+            enabled, level = support.intent(key)
+            controls = prompt_controls(
+                enabled=enabled,
+                level=level,
+                controls=support.controls,
+                native=support.native,
+            )
+        return wire, controls, support
+
+    @staticmethod
+    def _apply_prompt_controls(
+        messages: Sequence[ChatMessage], controls: PromptControls
+    ) -> List[ChatMessage]:
+        """Return *messages* with the reasoning instructions woven in.
+
+        The effort sentence goes in front of the first system message - the
+        same position the chat template would have rendered it - and the soft
+        switch is appended to the final user turn, which is where Qwen style
+        templates look for it.
+        """
+        prepared = list(messages)
+        if not controls:
+            return prepared
+
+        if controls.system:
+            for index, message in enumerate(prepared):
+                if message.role == Role.SYSTEM:
+                    prepared[index] = ChatMessage(
+                        role=Role.SYSTEM,
+                        content=f"{controls.system}\n\n{message.content}",
+                        name=message.name,
+                    )
+                    break
+            else:
+                prepared.insert(0, ChatMessage(role=Role.SYSTEM, content=controls.system))
+
+        if controls.suffix:
+            for index in range(len(prepared) - 1, -1, -1):
+                message = prepared[index]
+                if message.role == Role.USER:
+                    if controls.suffix not in message.content:
+                        prepared[index] = ChatMessage(
+                            role=Role.USER,
+                            content=f"{message.content}\n\n{controls.suffix}",
+                            name=message.name,
+                        )
+                    break
+        return prepared
+
     # ----------------------------------------------------------------- chat
     def chat_stream(
         self,
@@ -515,20 +707,28 @@ class OllamaClient:
         instead of making the server reject the whole request.
         """
         model_name = model or self.settings.model
+        think_value, controls, support = self.think_plan(think, model_name)
+        prepared = self._apply_prompt_controls(messages, controls)
+        wanted_silence = think_value is False or controls.suffix == SOFT_SWITCH_OFF
         payload: Dict[str, Any] = {
             "model": model_name,
-            "messages": [m.to_payload() for m in messages],
+            "messages": [m.to_payload() for m in prepared],
             "stream": True,
             "keep_alive": self.settings.keep_alive,
             "options": {**self.settings.options(), **(options or {})},
         }
         if format_json:
             payload["format"] = "json"
-        think_value = self._think_value(think, model_name)
         if think_value is not None:
             payload["think"] = think_value
 
-        prompt_tokens_estimate = count_message_tokens(messages)
+        # Models whose server does not split the trace emit it inline in the
+        # answer; the filter routes it to the reasoning channel so the tool
+        # parser only ever sees real output.
+        strip_inline = bool(self.settings.strip_inline_reasoning) and not format_json
+        inline = ReasoningFilter() if strip_inline else None
+
+        prompt_tokens_estimate = count_message_tokens(prepared)
         started = time.monotonic()
         response = self._request("POST", "/api/chat", payload=payload, stream=True, cancel=cancel)
 
@@ -552,14 +752,29 @@ class OllamaClient:
                 message = chunk.get("message") or {}
                 delta = str(message.get("content", "") or "")
                 reasoning = str(message.get("thinking", "") or "")
+                if delta and inline is not None:
+                    delta, extracted = inline.feed(delta)
+                    if extracted:
+                        reasoning += extracted
+                        self.last_reasoning_leaked = True
                 if delta:
                     collected.append(delta)
                 if reasoning:
                     thoughts.append(reasoning)
+                    if wanted_silence:
+                        self.last_think_ignored = True
                 done = bool(chunk.get("done"))
                 usage: Optional[Usage] = None
                 if done:
                     final_seen = True
+                    if inline is not None:
+                        tail, tail_reasoning = inline.flush()
+                        if tail:
+                            delta += tail
+                            collected.append(tail)
+                        if tail_reasoning:
+                            reasoning += tail_reasoning
+                            thoughts.append(tail_reasoning)
                     usage = self._usage_from_chunk(
                         chunk,
                         fallback_prompt=prompt_tokens_estimate,
@@ -614,6 +829,8 @@ class OllamaClient:
         streaming mode performs a single blocking POST.
         """
         self.last_thinking = ""
+        self.last_reasoning_leaked = False
+        self.last_think_ignored = False
         if self.settings.stream:
             parts: List[str] = []
             thoughts: List[str] = []
@@ -640,16 +857,17 @@ class OllamaClient:
             return "".join(parts), usage
 
         model_name = model or self.settings.model
+        think_value, controls, support = self.think_plan(think, model_name)
+        prepared = self._apply_prompt_controls(messages, controls)
         payload: Dict[str, Any] = {
             "model": model_name,
-            "messages": [m.to_payload() for m in messages],
+            "messages": [m.to_payload() for m in prepared],
             "stream": False,
             "keep_alive": self.settings.keep_alive,
             "options": {**self.settings.options(), **(options or {})},
         }
         if format_json:
             payload["format"] = "json"
-        think_value = self._think_value(think, model_name)
         if think_value is not None:
             payload["think"] = think_value
         started = time.monotonic()
@@ -665,13 +883,20 @@ class OllamaClient:
         message = data.get("message") or {}
         text = str(message.get("content", "") or "")
         self.last_thinking = str(message.get("thinking", "") or "")
+        if self.settings.strip_inline_reasoning and not format_json:
+            text, extracted = split_inline_reasoning(text)
+            if extracted:
+                self.last_reasoning_leaked = True
+                self.last_thinking = f"{self.last_thinking}{extracted}"
+        if self.last_thinking and think_value is False:
+            self.last_think_ignored = True
         if on_thinking is not None and self.last_thinking:
             on_thinking(self.last_thinking)
         if on_delta is not None and text:
             on_delta(text)
         usage = self._usage_from_chunk(
             data,
-            fallback_prompt=count_message_tokens(messages),
+            fallback_prompt=count_message_tokens(prepared),
             fallback_completion=text,
             elapsed_ms=int((time.monotonic() - started) * 1000),
         )
@@ -680,12 +905,8 @@ class OllamaClient:
     # ---------------------------------------------------------------- utils
     def _think_value(self, spec: Optional[str], model: str) -> Optional[Any]:
         """Resolve the ``think`` request field, or ``None`` to omit it."""
-        raw = self.settings.think if spec is None else spec
-        key = str(raw or "").strip().lower()
-        if key in ("", THINK_AUTO):
-            return None
         try:
-            return self.thinking_support(model).resolve(key)
+            return self.think_plan(spec, model)[0]
         except OllamaError:  # pragma: no cover - show() already swallows
             return None
 

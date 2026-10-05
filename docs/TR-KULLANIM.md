@@ -86,18 +86,54 @@ Model seçici artık üst çubukta değil, **yazdığınız kutunun hemen altın
 | `effort` listesi | Düşünme düzeyi |
 | `● online · …` | Ollama bağlantı durumu (üstüne gelin: sürüm ve adres) |
 
-**Önemli:** bu seçeneklerin içeriği uydurulmaz. Agent3 model değiştiğinde
-Ollama'ya `/api/show` sorar ve modelin bildirdiği `thinking.values` listesini
-aynen gösterir:
+**Önemli: sınıflandırma model ADINA göre değil, kanıta göre yapılır.**
+Agent3'te "şu aile şunu destekler" diye bir tablo yoktur. Model değiştiğinde
+`/api/show` sorulur ve şu sırayla gerçek kanıt aranır:
 
-* `qwen3`, `deepseek-r1` gibi modeller → sadece **açık/kapalı**;
-* `gpt-oss` → sadece **low / medium / high**, ve kapatılamaz (kutu kilitli görünür);
-* bazı modellerde ek olarak **max**;
-* düşünme yeteneği olmayan bir model → kontrol **gri** ve "no reasoning" yazar.
+| # | Kaynak | Ne kanıtlar | Rozet |
+|---|---|---|---|
+| 1 | `thinking: {"values": [...], "default": ...}` | Kesin bilgi; sunucu `think` alanını kendisi uygular | `effort` / `server` |
+| 2 | Modelin **chat template**'i | `enable_thinking` → aç/kapa; `reasoning_effort`'ün karşılaştırıldığı tırnaklı liste → **gerçek seviye adları** | `template` |
+| 3 | `capabilities` içinde `"thinking"` | Yalnızca aç/kapa, seviye yok | `capability` |
+| 4 | Hiçbiri | Model akıl yürütmüyor | `no reasoning` |
 
-Modelin kabul etmediği bir değer isteğe hiç konmaz, böylece sunucu isteği
-tümden reddetmez. Akıl yürütme metni yanıttan ayrı bir **"Reasoning"**
-bloğunda akar; blok varsayılan olarak kapalıdır, tıklayarak açarsınız.
+2. adım, topluluk GGUF paketlerini çalıştıran şeydir. Qwen3.x template'i şunu
+içerir:
+
+```jinja
+{%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}
+{%- if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') %}
+```
+
+Bu yüzden `bernquant/Qwen3.5-9B-…-GGUF` gibi bir modelde **X-High / Medium /
+Low** seçenekleri çıkar (varsayılan `xhigh`), adı ne olursa olsun.
+
+#### "Kapattım ama yine düşünüyor" sorunu
+
+Ollama `think` alanını **her** chat template'ine iletmez. Template
+`{%- if enable_thinking is undefined or enable_thinking is true %}` ile
+başlıyorsa, "bir şey söylenmedi" durumunu "tam efor ile düşün" sayar — kapalı
+olmasına rağmen düşünmesinin sebebi tam olarak budur. Sunucu yerel
+`thinking` verisi bildirmediğinde iki savunma birlikte devreye girer:
+
+* **Ayar istemin içinde tekrarlanır.** Seviye için template'in *kendi* cümlesi
+  (`"Reasoning effort is set to low. Keep your thinking brief and focused…"`)
+  ilk sistem mesajının önüne — template'in basacağı yere — eklenir. "Kapalı"
+  için belgelenmiş `/no_think` yumuşak anahtarı son kullanıcı mesajına eklenir
+  ve açık bir talimat yazılır. Hiçbir metin uydurulmaz; cümleler template'in
+  içinden birebir alınır.
+* **Satır içi düşünme süzülür.** Model yine de düşünür ve sunucu izi
+  `message.content` içinde döndürürse, akış sırasında çalışan bir durum
+  makinesi `<think>`, `<thinking>`, `<reasoning>`, `◁think▷` bloklarını
+  yanıttan ayırır (parça sınırında bölünmüş etiketleri de yakalar) ve
+  Reasoning kanalına yollar. Böylece araç ayrıştırıcısı modelin müsveddesini
+  asla görmez; durum çubuğunda bir kez "bu model kapalıyken de düşünüyor"
+  uyarısı belirir.
+
+Her ikisi de **Ayarlar → Transport** altından kapatılabilir. Modelin kabul
+etmediği bir değer isteğe hiç konmaz, böylece sunucu isteği tümden reddetmez.
+Akıl yürütme metni yanıttan ayrı bir **"Reasoning"** bloğunda akar; blok
+varsayılan olarak kapalıdır, tıklayarak açarsınız.
 
 ### PLAN paneli
 

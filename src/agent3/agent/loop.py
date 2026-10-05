@@ -133,6 +133,9 @@ class AgentLoop:
         self.extra_instructions = extra_instructions
         self.history: List[ChatMessage] = []
         self._cancel = threading.Event()
+        #: Guards the "model ignored thinking: off" notice so it is
+        #: shown once per loop rather than on every step.
+        self._think_warning_sent = False
         #: Reasoning spec forwarded to Ollama's ``think`` field. ``None`` means
         #: "use whatever the connection settings say".
         self.think: Optional[str] = None
@@ -262,6 +265,7 @@ class AgentLoop:
                         on_thinking=lambda delta: self.callbacks.emit("on_thinking_delta", delta),
                     )
                     result.thinking = getattr(self.client, "last_thinking", "")
+                    self._warn_if_think_ignored()
                 except OllamaCancelled:
                     result.stop_reason = AgentStopReason.CANCELLED
                     break
@@ -493,6 +497,25 @@ class AgentLoop:
             result.total_tokens,
         )
         return result
+
+    def _warn_if_think_ignored(self) -> None:
+        """Tell the user once when the model reasoned despite being muted.
+
+        Some servers drop the ``think`` field before it reaches the chat
+        template, so a model asked for silence keeps emitting a trace. The
+        client still routes it to the reasoning channel, but the user should
+        know their setting is not being honoured end to end.
+        """
+        if self._think_warning_sent:
+            return
+        if not getattr(self.client, "last_think_ignored", False):
+            return
+        self._think_warning_sent = True
+        self.callbacks.emit(
+            "on_status",
+            "This model keeps reasoning even with thinking turned off - the "
+            "trace is being filtered out of its answers.",
+        )
 
     def _refuse_finish(self, call: ToolCall, reason: str, hint: str, status: str) -> None:
         """Reject a premature ``finish`` and feed the model a repair hint."""

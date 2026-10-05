@@ -133,22 +133,56 @@ user instruction
 
 ### Reasoning control
 
-Ollama returns a model's reasoning in a separate `message.thinking` field and
-accepts a `think` request field, but **the accepted values differ per model**:
-most thinking models take `true`/`false`, gpt-oss takes only `low`/`medium`/`high`
-and cannot be switched off, and some models add `max`. Agent3 therefore never
-hard-codes a list. It calls `/api/show`, reads the `thinking` object
-(`{"values": [...], "default": ...}`), and builds the control strip under the
-message box from exactly those values:
+Reasoning support is detected from **evidence, never from the model's name**.
+A model called `gpt-oss` with no capability reported gets no controls, and an
+obscure community repack gets full effort levels if its template really has
+them. `/api/show` is consulted once per model and read in this order:
 
-* a model with no thinking capability shows a disabled control, not fake levels;
-* a model that cannot stop reasoning shows the switch locked on;
-* a value the model does not accept is dropped before the request is sent,
-  instead of making the server reject the whole call.
+| # | Source | What it proves | Badge |
+|---|---|---|---|
+| 1 | `thinking: {"values": [...], "default": ...}` | Authoritative - the server honours the `think` field itself | `effort` / `server` |
+| 2 | The model's **chat template** | `enable_thinking` means on/off; `reasoning_effort` validated against a literal tuple gives the exact level names | `template` |
+| 3 | `capabilities` contains `"thinking"` | On/off only, no levels | `capability` |
+| 4 | Nothing | The model does not reason | `no reasoning` |
 
-The reasoning trace is streamed into its own collapsed block in the transcript
-and is never fed to the tool-call parser, so the model's scratchpad can never
-be mistaken for an action.
+Step 2 is what makes GGUF repacks work. A Qwen3.x template contains
+
+```jinja
+{%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}
+{%- if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') %}
+```
+
+so Agent3 offers exactly `xhigh`, `medium` and `low` for that file - whatever
+the model is called - and marks `xhigh` as its default.
+
+#### Making the setting stick
+
+Ollama does **not** forward the `think` field into every chat template. A
+template that begins `{%- if enable_thinking is undefined or enable_thinking
+is true %}` therefore treats "no opinion" as "reason at full effort", which is
+why models keep thinking after the switch is turned off. Two defences run
+together whenever the server did not report native `thinking` metadata:
+
+* **The instruction is repeated in the prompt.** For a level, Agent3 injects
+  the template's *own* sentence (`"Reasoning effort is set to low. Keep your
+  thinking brief and focused…"`) in front of the first system message - the
+  same place the template would have rendered it. For "off", the documented
+  `/no_think` soft switch is appended to the last user turn and an explicit
+  instruction is added. Nothing is invented: the sentences are lifted out of
+  the template when it carries them.
+* **Inline traces are filtered out.** When a model reasons anyway and the
+  server returns the trace inside `message.content`, a streaming state machine
+  strips `<think>`, `<thinking>`, `<reasoning>` and `◁think▷` blocks out of
+  the answer and routes them to the reasoning channel - tolerating tags split
+  across chunk boundaries. The tool-call parser therefore never sees the
+  scratchpad, and the status bar says once that the model is ignoring the
+  switch.
+
+Both behaviours can be turned off in **Settings → Transport**
+(`strip_inline_reasoning`, `enforce_think_in_prompt`). A value the model does
+not accept is still dropped before the request is sent, instead of making the
+server reject the whole call, and the trace is always shown in its own
+collapsed block in the transcript.
 
 ### Long-running processes
 

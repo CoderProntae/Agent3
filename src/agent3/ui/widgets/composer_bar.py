@@ -31,7 +31,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from agent3.llm.ollama_client import THINK_AUTO, THINK_OFF, THINK_ON, ThinkingSupport
+from agent3.llm.ollama_client import (
+    SOURCE_CAPABILITY,
+    SOURCE_METADATA,
+    SOURCE_TEMPLATE,
+    THINK_AUTO,
+    THINK_OFF,
+    THINK_ON,
+    ThinkingSupport,
+)
+from agent3.llm.reasoning import level_label
 from agent3.ui.theme import COLORS
 
 #: Combo entry that lets the server decide.
@@ -190,7 +199,10 @@ class ComposerBar(QFrame):
                 )
                 self.level_box.setVisible(False)
                 self.capability_label.setText("no reasoning")
-                self.capability_label.setToolTip("")
+                self.capability_label.setToolTip(
+                    "Neither the server's thinking metadata nor the chat "
+                    "template exposes a reasoning control for this model."
+                )
                 self._spec = THINK_AUTO
                 return
 
@@ -206,17 +218,17 @@ class ComposerBar(QFrame):
                 self.level_box.setVisible(True)
                 self.level_box.addItem(AUTO_LABEL, THINK_AUTO)
                 for level in levels:
-                    self.level_box.addItem(level.capitalize(), level)
-                self.capability_label.setText("effort")
+                    self.level_box.addItem(level_label(level), level)
+                self.capability_label.setText(self._source_badge())
             elif True in support.values or not support.known:
                 # On/off model: the checkbox alone is the whole control.
                 self.level_box.setVisible(False)
-                self.capability_label.setText("")
+                self.capability_label.setText(self._source_badge())
             else:  # pragma: no cover - defensive
                 self.level_box.setVisible(False)
-                self.capability_label.setText("")
+                self.capability_label.setText(self._source_badge())
 
-            self.capability_label.setToolTip(support.describe())
+            self.capability_label.setToolTip(self._support_tooltip())
 
             spec = self._spec
             if spec == THINK_OFF and support.can_disable:
@@ -233,6 +245,36 @@ class ComposerBar(QFrame):
             self.level_box.setEnabled(self.think_toggle.isChecked())
         finally:
             self._updating = False
+
+    def _source_badge(self) -> str:
+        """Tiny caption telling the user where the controls came from.
+
+        Discovery is evidence based, so the badge says which evidence was
+        found rather than implying every model of a given name behaves alike.
+        """
+        support = self._support
+        if support.source == SOURCE_METADATA:
+            return "effort" if support.levels else "server"
+        if support.source == SOURCE_TEMPLATE:
+            return "template"
+        if support.source == SOURCE_CAPABILITY:
+            return "capability"
+        return ""
+
+    def _support_tooltip(self) -> str:
+        support = self._support
+        lines = [support.describe()]
+        if support.source == SOURCE_TEMPLATE:
+            lines.append(
+                "Read from this model's chat template, which is what actually "
+                "runs for this file."
+            )
+        if support.needs_prompt_enforcement:
+            lines.append(
+                "Ollama does not forward the think field into this template, "
+                "so the setting is also stated in the prompt."
+            )
+        return "\n".join(lines)
 
     def _select_level(self, value: str) -> None:
         index = self.level_box.findData(value)
