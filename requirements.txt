@@ -1,0 +1,13 @@
+# ---------------------------------------------------------------------------
+# Agent3 - runtime dependencies
+# ---------------------------------------------------------------------------
+# GUI toolkit (Qt6 bindings). "Essentials" keeps the frozen binary small while
+# still providing QtWidgets / QtGui / QtCore / QtNetwork.
+PySide6-Essentials==6.8.1.1
+
+# HTTP client used by the Ollama transport layer (keep-alive + streaming).
+requests==2.32.3
+urllib3==2.2.3
+
+# Authenticated encryption for the local quota / credential store.
+cryptography==43.0.3
