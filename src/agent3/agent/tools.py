@@ -25,7 +25,16 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 from agent3.core.logging_setup import get_logger, log_exception
-from agent3.workspace.diffing import EditError, apply_search_replace, diff_stats, make_unified_diff
+from agent3.workspace.diffing import (
+    EditError,
+    PatchError,
+    apply_search_replace,
+    apply_unified_patch,
+    diff_stats,
+    make_unified_diff,
+    patch_target_path,
+)
+from agent3.workspace.outline import build_outline
 from agent3.workspace.fs import WorkspaceFS, WorkspaceSecurityError
 from agent3.workspace.git_ops import GitRepo
 from agent3.workspace.terminal import CommandRunner
@@ -227,6 +236,97 @@ def _tool_edit_file(ctx: ToolContext, args: Dict[str, Any]) -> ToolResult:
     )
 
 
+def _tool_view_outline(ctx: ToolContext, args: Dict[str, Any]) -> ToolResult:
+    """Structural map of a file: classes, functions, signatures, docstrings."""
+    path = str(_arg(args, "path", "file", "filename", default=""))
+    if not path:
+        return ToolResult(False, error="'path' is required")
+    if ctx.fs.is_dir(path):
+        return ToolResult(
+            False,
+            error=f"{path} is a directory - use list_files for directories",
+            title=f"view_outline {path}",
+        )
+    source = ctx.fs.read_text(path)
+    outline = build_outline(path, source)
+    include_imports = _as_bool(_arg(args, "imports", "include_imports", default=True), True)
+    body = outline.render(include_imports=include_imports)
+    if outline.is_empty and outline.error:
+        # Not a failure: the model simply has to fall back to read_file.
+        body += "\n(hint: call read_file for this file type)"
+    return ToolResult(
+        True,
+        output=body,
+        data=outline.to_dict(),
+        title=f"view_outline {path}",
+    )
+
+
+def _tool_patch_file(ctx: ToolContext, args: Dict[str, Any]) -> ToolResult:
+    """Apply a multi-hunk unified diff in a single, atomic step."""
+    patch = _arg(args, "patch", "diff", "unified_diff", "content", default=None)
+    if patch is None or not str(patch).strip():
+        return ToolResult(False, error="'patch' is required and must contain a unified diff")
+    patch = str(patch)
+    path = str(_arg(args, "path", "file", "filename", default="") or patch_target_path(patch))
+    if not path:
+        return ToolResult(
+            False,
+            error="'path' is required (or add a '+++ b/<path>' header to the patch)",
+        )
+    # Resolve first so an escape attempt reports the real reason (the sandbox)
+    # instead of the misleading "file does not exist".
+    ctx.fs.resolve(path)
+    if not ctx.fs.exists(path):
+        return ToolResult(
+            False,
+            error=f"{path} does not exist - use write_file to create it",
+            title=f"patch_file {path}",
+        )
+
+    previous = ctx.fs.read_text(path)
+    try:
+        patched = apply_unified_patch(previous, patch)
+    except PatchError as exc:
+        return ToolResult(False, error=str(exc), title=f"patch_file {path}")
+    if patched.content == previous:
+        return ToolResult(
+            False,
+            error="the patch produced no change - the file already matches the desired state",
+            title=f"patch_file {path}",
+        )
+
+    ctx.fs.write_text(path, patched.content)
+    unified = make_unified_diff(previous, patched.content, path)
+    stats = diff_stats(unified)
+    if ctx.on_file_changed:
+        ctx.on_file_changed(path, unified)
+
+    notes = []
+    if patched.shifted:
+        notes.append(f"hunks shifted by {patched.offsets} line(s)")
+    if patched.fuzzy:
+        notes.append(f"{patched.fuzzy} hunk(s) matched ignoring whitespace")
+    suffix = f" ({'; '.join(notes)})" if notes else ""
+    return ToolResult(
+        True,
+        output=(
+            f"patched {path}: {patched.hunks_applied} hunk(s) applied, "
+            f"+{stats.added} -{stats.removed}{suffix}"
+        ),
+        data={
+            "path": path,
+            "hunks": patched.hunks_applied,
+            "added": stats.added,
+            "removed": stats.removed,
+            "offsets": patched.offsets,
+            "fuzzy": patched.fuzzy,
+        },
+        diff=unified,
+        title=f"patch_file {path}",
+    )
+
+
 def _tool_delete_file(ctx: ToolContext, args: Dict[str, Any]) -> ToolResult:
     path = str(_arg(args, "path", "file", default=""))
     if not path:
@@ -284,10 +384,15 @@ def _tool_run_command(ctx: ToolContext, args: Dict[str, Any]) -> ToolResult:
         timeout=timeout,
         on_output=ctx.on_command_output,
     )
+    summary = result.summary(ctx.max_output_chars)
+    if getattr(result, "interactive", False):
+        # Surface the remediation advice as the error so the loop feeds it
+        # straight back to the model instead of a bare "exit 125".
+        summary = f"{summary}\n\n{result.error}"
     return ToolResult(
         ok=result.ok,
-        output=result.summary(ctx.max_output_chars),
-        error="" if result.ok else result.summary(ctx.max_output_chars),
+        output=summary,
+        error="" if result.ok else summary,
         data=result.to_dict(),
         title=f"run_command {command[:60]}",
     )
@@ -398,6 +503,20 @@ class ToolRegistry:
         )
         self.register(
             ToolSpec(
+                "view_outline",
+                "Map a source file WITHOUT reading it: classes, functions, methods, signatures, "
+                "docstrings and line numbers. Use this before read_file on anything large, then "
+                "read only the line range you actually need.",
+                {
+                    "path": "relative file path",
+                    "imports": "false to hide the import list (default true)",
+                },
+                _tool_view_outline,
+                required=["path"],
+            )
+        )
+        self.register(
+            ToolSpec(
                 "write_file",
                 "Create a file or replace its entire content. Always send the complete file.",
                 {"path": "relative file path", "content": "the full new file content"},
@@ -417,6 +536,21 @@ class ToolRegistry:
                 },
                 _tool_edit_file,
                 required=["path", "search", "replace"],
+            )
+        )
+        self.register(
+            ToolSpec(
+                "patch_file",
+                "Apply a multi-hunk unified diff to ONE file in a single atomic step. Use this "
+                "instead of several consecutive edit_file calls when a file changes in two or "
+                "more places: hunks are located by their context, so later hunks still land "
+                "after earlier ones shifted the line numbers.",
+                {
+                    "path": "relative file path (optional if the patch has a '+++ b/<path>' header)",
+                    "patch": "the unified diff: '@@ -old,count +new,count @@' hunks with ' ' context, '-' removed and '+' added lines",
+                },
+                _tool_patch_file,
+                required=["patch"],
             )
         )
         self.register(

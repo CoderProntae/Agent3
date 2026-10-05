@@ -76,6 +76,52 @@ python -m usage_limit_editor   # yönetici aracı
 **Kısayollar:** `Ctrl+O` klasör aç · `Ctrl+Enter` çalıştır · `Esc` durdur · `Ctrl+S` kaydet ·
 `Ctrl+N` yeni oturum · `Ctrl+,` ayarlar · ``Ctrl+` `` terminali aç/kapat.
 
+### Eylem kartlarını okumak
+
+Ajanın her adımı sohbette bir kart olarak belirir:
+
+| Öğe | Anlamı |
+|---|---|
+| `✓` yeşil | Araç başarılı |
+| `✕` kırmızı | Araç hata verdi — ajan hatayı okuyup kendini düzeltir |
+| `!` kırmızı | Komut güvenlik politikası veya interaktif komut tuzağı tarafından engellendi |
+| `●` sarı | Hâlâ çalışıyor |
+| `+8 -2` rozeti | Dosya değişikliğinde eklenen/silinen satır sayısı |
+| **Diff** düğmesi | Kartı açar: **yalnızca değişen satırlar**, eski/yeni satır numaralarıyla, eklemeler yeşil (`+`), silmeler kırmızı (`-`), bağlam satırları soluk |
+| **Details** düğmesi | Komut çıktısı: hatalar kırmızı, geçen testler yeşil, uyarılar sarı renklendirilir |
+
+---
+
+## 3.1 Ajanın çalışma disiplini
+
+**Ucuz keşif.** Ajan büyük bir dosyayı okumadan önce `view_outline` çağırır:
+sınıflar, fonksiyonlar, imzalar, docstring'ler ve satır numaraları — dosyanın
+gövdesini bağlama yüklemeden. Sonra yalnızca ihtiyacı olan satır aralığını okur.
+
+**Tek seferde düzenleme.** Bir dosyanın üç ayrı yeri değişecekse ajan üç kez
+`edit_file` çağırmaz; tek bir `patch_file` ile çok parçalı (multi-hunk) unified
+diff uygular. Parçalar satır numarasına değil **bağlama** göre yerleştirilir,
+böylece önceki parça satır sayısını kaydırsa bile sonrakiler doğru yere oturur.
+
+**Hiçbir komut sizi beklemez.** Ajanın içinde soruya cevap verebilecek kimse
+yoktur. İki katman bunu engeller:
+
+1. `npm init`, `apt-get install`, `-m`'siz `git commit`, `vim`, `less`, argümansız
+   `python` gibi ~15 kalıp **çalıştırılmadan önce** reddedilir ve modele
+   non-interaktif biçimi söylenir (`npm init -y` gibi).
+2. Bir komut soru sorup susarsa (15 sn) süreç ağacı öldürülür. Çıktı satır
+   satır değil ham blok olarak okunduğu için `Devam? [e/H] ` gibi **satır sonu
+   olmayan** promptlar da görülür. Sessizce derleme yapan bir komut asla prompt
+   sanılmaz.
+
+**Bitmiş iş tanımı.** Ajan dosya değiştirdiyse ve son düzenlemeden sonra
+başarılı bir komut çalıştırmadıysa `finish` **bir kez reddedilir** ve ajan
+testlerine geri gönderilir (`pytest -q`, `npm test`, `go test ./...` veya bir
+derleme/import kontrolü). Doğrulama başarısızsa farklı bir uyarı alır. Israr
+ederse kilitlenme olmaz; ikinci deneme kabul edilir ama özetin altına görünür
+bir uyarı düşülür. Kapatmak için `config.json` içinde
+`agent.require_verification = false`.
+
 ---
 
 ## 4. Kullanım limitleri (kurumsal kota)

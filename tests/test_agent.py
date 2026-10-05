@@ -202,9 +202,11 @@ class TestAgentLoop:
         return client, loop
 
     def test_single_write_then_finish(self, usage_manager, tool_context):
+        """A write followed by a successful check is a complete run."""
         _client, loop = self.build(
             [
                 tool_block("write_file", path="out.py", content="print('x')\n"),
+                tool_block("run_command", command="python -c \"print(1)\""),
                 tool_block("finish", summary="Created out.py"),
             ],
             usage_manager,
@@ -213,8 +215,106 @@ class TestAgentLoop:
         result = loop.run("create out.py")
         assert result.stop_reason is AgentStopReason.FINISHED
         assert result.final_message == "Created out.py"
-        assert result.tool_calls == 1
+        assert result.tool_calls == 2
+        assert result.verified is True
+        assert result.changed_files == ["out.py"]
         assert tool_context.fs.read_text("out.py") == "print('x')\n"
+
+    def test_write_without_verification_is_pushed_back(self, usage_manager, tool_context):
+        """`finish` straight after an edit is refused once, with guidance."""
+        client, loop = self.build(
+            [
+                tool_block("write_file", path="out.py", content="print('x')\n"),
+                tool_block("finish", summary="Created out.py"),
+                tool_block("run_command", command="python -c \"print(1)\""),
+                tool_block("finish", summary="Created out.py and verified it"),
+            ],
+            usage_manager,
+            tool_context,
+        )
+        result = loop.run("create out.py")
+        assert result.stop_reason is AgentStopReason.FINISHED
+        # The model was told to verify before the second finish was accepted.
+        nudges = [
+            m.content
+            for turn in client.calls
+            for m in turn
+            if "you are about to finish without verifying" in m.content
+        ]
+        assert nudges, "the loop must push the model back to its tests"
+        assert "pytest -q" in nudges[0]
+        assert result.verified is True
+        assert result.verification_command.startswith("python -c")
+        assert result.final_message == "Created out.py and verified it"
+
+    def test_verification_nudge_happens_only_once(self, usage_manager, tool_context):
+        """A stubborn model is not deadlocked - it finishes with a warning."""
+        _client, loop = self.build(
+            [
+                tool_block("write_file", path="out.py", content="print('x')\n"),
+                tool_block("finish", summary="done"),
+                tool_block("finish", summary="done"),
+            ],
+            usage_manager,
+            tool_context,
+        )
+        result = loop.run("create out.py")
+        assert result.stop_reason is AgentStopReason.FINISHED
+        assert result.verified is False
+        assert "could not confirm these changes" in result.final_message
+
+    def test_failed_command_blocks_finish_with_its_own_hint(self, usage_manager, tool_context):
+        """A red test run is not 'done' - the model is told to fix it."""
+        client, loop = self.build(
+            [
+                tool_block("write_file", path="out.py", content="print('x')\n"),
+                tool_block("run_command", command="python -c \"raise SystemExit(3)\""),
+                tool_block("finish", summary="done"),
+                tool_block("run_command", command="python -c \"print(1)\""),
+                tool_block("finish", summary="fixed and verified"),
+            ],
+            usage_manager,
+            tool_context,
+        )
+        result = loop.run("create out.py")
+        hints = [
+            m.content
+            for turn in client.calls
+            for m in turn
+            if "your last verification command failed" in m.content
+        ]
+        assert hints, "a failing check must block finish"
+        assert "exited with 3" in hints[0]
+        assert result.verified is True
+
+    def test_read_only_run_can_finish_without_verification(self, usage_manager, tool_context):
+        """Nothing was changed, so there is nothing to verify."""
+        _client, loop = self.build(
+            [
+                tool_block("list_files", path="."),
+                tool_block("finish", summary="The project has 3 files."),
+            ],
+            usage_manager,
+            tool_context,
+        )
+        result = loop.run("what is here?")
+        assert result.stop_reason is AgentStopReason.FINISHED
+        assert result.final_message == "The project has 3 files."
+        assert result.changed_files == []
+
+    def test_verification_gate_can_be_disabled(self, usage_manager, tool_context):
+        _client, loop = self.build(
+            [
+                tool_block("write_file", path="out.py", content="print('x')\n"),
+                tool_block("finish", summary="done"),
+            ],
+            usage_manager,
+            tool_context,
+            require_verification=False,
+        )
+        result = loop.run("create out.py")
+        assert result.stop_reason is AgentStopReason.FINISHED
+        assert result.final_message == "done"
 
     def test_usage_is_recorded(self, usage_manager, tool_context):
         _client, loop = self.build([tool_block("finish", summary="ok")], usage_manager, tool_context)
@@ -298,6 +398,7 @@ class TestAgentLoop:
             [tool_block("write_file", path="a.txt", content="a"), tool_block("finish", summary="ok")],
             usage_manager,
             tool_context,
+            require_verification=False,
         )
         loop.callbacks = AgentCallbacks(
             on_status=lambda _t: events.__setitem__("status", events["status"] + 1),

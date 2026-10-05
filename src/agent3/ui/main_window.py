@@ -432,6 +432,8 @@ class MainWindow(QMainWindow):
             fs.root,
             blocked_patterns=self.config.agent.blocked_command_patterns,
             default_timeout=self.config.agent.command_timeout,
+            detect_interactive=self.config.agent.detect_interactive_commands,
+            interactive_idle_seconds=self.config.agent.interactive_idle_seconds,
         )
         self.git = GitRepo(fs.root)
         self.tool_context = ToolContext(
@@ -626,13 +628,19 @@ class MainWindow(QMainWindow):
         card = self._active_cards.pop(id(call), None)
         if card is None:
             card = self.chat.add_action_card(f"[AGENT] {call.name}", self._describe_call(call))
-        card.set_status("success" if result.ok else "error", f"{result.duration_ms} ms")
+        blocked = bool(result.data.get("blocked") or result.data.get("interactive"))
+        status = "success" if result.ok else ("blocked" if blocked else "error")
+        card.set_status(status, f"{result.duration_ms} ms")
         card.set_subtitle(result.output.splitlines()[0][:160] if result.ok and result.output else
                           (result.error.splitlines()[0][:160] if result.error else ""))
         details = result.output if result.ok else (result.error or "")
         if result.diff:
+            # A file change gets the review view: only the changed lines, with
+            # old/new line numbers, green additions and red deletions.
+            card.set_diff(result.diff)
             details = f"{details}\n\n{result.diff}" if details else result.diff
-        card.set_details(details)
+        else:
+            card.set_details(details, kind="output")
 
         if self._current_session_id:
             self.sessions.add_message(

@@ -112,6 +112,16 @@ class AgentSettings:
     max_output_chars: int = 20_000
     max_file_read_bytes: int = 1_000_000
     history_window: int = 40
+    #: Refuse `finish` while files changed in this run are still unverified.
+    require_verification: bool = True
+    #: How many times the loop pushes the model back to run its tests.
+    verification_nudges: int = 1
+    #: Refuse commands that obviously need a human, and kill the ones that
+    #: print a question and then wait forever.
+    detect_interactive_commands: bool = True
+    #: Seconds of silence after a prompt-looking line before the command is
+    #: treated as "waiting for input".
+    interactive_idle_seconds: float = 15.0
     blocked_command_patterns: List[str] = field(
         default_factory=lambda: [
             r"rm\s+-rf\s+/",

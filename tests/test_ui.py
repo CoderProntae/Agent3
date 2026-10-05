@@ -191,3 +191,128 @@ class TestMainWindow:
 
         assert PolicyStore().load(force=True).max_requests_per_day == 250
         window.close()
+
+
+class TestDiffRendering:
+    """The action-card review view: green additions, red deletions, numbers."""
+
+    SAMPLE = (
+        "--- a/src/api.py\n"
+        "+++ b/src/api.py\n"
+        "@@ -1,4 +1,6 @@\n"
+        " from fastapi import FastAPI\n"
+        " \n"
+        " app = FastAPI()\n"
+        "+\n"
+        '+@app.get("/health")\n'
+        "-removed_line()\n"
+    )
+
+    def test_render_marks_additions_and_deletions(self):
+        from agent3.ui.diff_render import render_diff_html
+        from agent3.ui.theme import COLORS
+
+        html = render_diff_html(self.SAMPLE)
+        assert COLORS.added_bg in html and COLORS.added_fg in html
+        assert COLORS.removed_bg in html and COLORS.removed_fg in html
+        assert "/health" in html
+        assert "<table" in html
+
+    def test_headers_are_hidden_in_cards_by_default(self):
+        from agent3.ui.diff_render import render_diff_html
+
+        assert "a/src/api.py" not in render_diff_html(self.SAMPLE)
+        assert "a/src/api.py" in render_diff_html(self.SAMPLE, show_headers=True)
+
+    def test_line_numbers_are_present(self):
+        from agent3.ui.diff_render import render_diff_html
+
+        html = render_diff_html(self.SAMPLE)
+        assert ">1<" in html and ">3<" in html
+
+    def test_html_is_escaped(self):
+        from agent3.ui.diff_render import render_diff_html
+
+        html = render_diff_html('@@ -1 +1 @@\n+<script>alert("x")</script>\n')
+        assert "<script>" not in html
+        assert "&lt;script&gt;" in html
+
+    def test_large_diffs_are_truncated_with_a_notice(self):
+        from agent3.ui.diff_render import render_diff_html
+
+        big = "@@ -1,600 +1,600 @@\n" + "".join(f"+line {i}\n" for i in range(600))
+        html = render_diff_html(big, max_rows=50)
+        assert "more diff lines" in html
+
+    def test_empty_diff_says_so(self):
+        from agent3.ui.diff_render import render_diff_html
+
+        assert "no textual changes" in render_diff_html("")
+
+    def test_badge_counts(self):
+        from agent3.ui.diff_render import diff_badge_text
+
+        assert diff_badge_text(self.SAMPLE) == "+2 -1"
+        assert diff_badge_text("") == ""
+
+    def test_detail_kind_sniffing(self):
+        from agent3.ui.diff_render import guess_detail_kind
+
+        assert guess_detail_kind(self.SAMPLE) == "diff"
+        assert guess_detail_kind("$ pytest -q\n1 passed") == "output"
+        assert guess_detail_kind(None) == "output"
+
+    def test_output_rendering_colours_failures_and_passes(self):
+        from agent3.ui.diff_render import render_output_html
+        from agent3.ui.theme import COLORS
+
+        html = render_output_html("$ pytest -q\n3 passed\nERROR: boom\nwarning: old api")
+        assert COLORS.success in html
+        assert COLORS.danger in html
+        assert COLORS.warning in html
+        assert COLORS.accent in html
+
+
+class TestActionCardDetails:
+    def test_card_renders_a_diff_and_shows_its_badge(self, qapp):
+        from agent3.ui.widgets.chat_view import ActionCard
+
+        card = ActionCard("[AGENT] write_file", "path: a.py")
+        card.set_diff("@@ -1,2 +1,2 @@\n-old\n+new\n context\n")
+        assert card.badge_text() == "+1 -1"
+        assert card._toggle.text() in {"Diff", "Hide diff"}
+        card._toggle.setChecked(True)
+        assert not card._details.isHidden()
+        assert "new" in card._details.toHtml()
+
+    def test_card_sniffs_a_diff_passed_as_details(self, qapp):
+        from agent3.ui.widgets.chat_view import ActionCard
+
+        card = ActionCard("[AGENT] patch_file")
+        card.set_details("@@ -1 +1 @@\n-a\n+b\n")
+        assert card.badge_text() == "+1 -1"
+        assert card._toggle.text() == "Diff"
+
+    def test_card_renders_command_output_as_console(self, qapp):
+        from agent3.ui.widgets.chat_view import ActionCard
+
+        card = ActionCard("[AGENT TERMINAL] run_command", "$ pytest -q")
+        card.set_details("$ pytest -q\n12 passed in 0.4s", kind="output")
+        assert card.badge_text() == ""
+        assert card._toggle.text() == "Details"
+        assert "12 passed" in card._details.toHtml()
+
+    def test_empty_details_hide_the_toggle(self, qapp):
+        from agent3.ui.widgets.chat_view import ActionCard
+
+        card = ActionCard("[AGENT] list_files")
+        card.set_details("")
+        assert card._toggle.isHidden() is True
+
+    def test_blocked_status_is_rendered(self, qapp):
+        from agent3.ui.widgets.chat_view import ActionCard
+
+        card = ActionCard("[AGENT TERMINAL] run_command", "$ npm init")
+        card.set_status("blocked", "4 ms")
+        assert card._icon.text() == "!"
+        assert "blocked" not in card._subtitle.text()

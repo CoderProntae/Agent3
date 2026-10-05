@@ -14,9 +14,11 @@ from enum import Enum
 from typing import Callable, Dict, List, Optional, Sequence
 
 from agent3.agent.prompts import (
+    FAILED_VERIFY_HINT,
     LOOP_HINT,
     NO_TOOL_HINT,
     RETRY_HINT,
+    VERIFY_HINT,
     build_observation,
     build_system_prompt,
     build_user_request,
@@ -79,6 +81,12 @@ class AgentRunResult:
     duration_ms: int = 0
     error: str = ""
     transcript: List[ChatMessage] = field(default_factory=list)
+    #: Workspace-relative paths written during the run.
+    changed_files: List[str] = field(default_factory=list)
+    #: True when a command succeeded after the final file modification.
+    verified: bool = False
+    #: The command used as proof, when there is one.
+    verification_command: str = ""
 
     @property
     def total_tokens(self) -> int:
@@ -182,6 +190,17 @@ class AgentLoop:
         repeated: Dict[str, int] = {}
         consecutive_failures = 0
 
+        # --- "definition of done" bookkeeping -----------------------------
+        #: Tools whose success leaves the workspace in an unverified state.
+        mutating = {"write_file", "edit_file", "patch_file", "delete_file", "rename_file"}
+        changed: List[str] = []
+        unverified = False          # files changed, nothing run since
+        verified_with = ""          # the command that proved the work
+        last_failed_command = ""
+        last_failed_exit = 0
+        nudges_left = max(0, int(getattr(self.settings, "verification_nudges", 1)))
+        require_verification = bool(getattr(self.settings, "require_verification", True))
+
         try:
             for iteration in range(1, max_iterations + 1):
                 if self._cancel.is_set():
@@ -274,6 +293,39 @@ class AgentLoop:
                 call = calls[0]
                 if call.name == "finish":
                     summary = str(call.args.get("summary") or call.args.get("message") or prose or "Task complete.")
+
+                    # Definition of done: code that was never executed is not
+                    # finished work. Push the model back to its test command
+                    # instead of accepting an optimistic summary.
+                    if require_verification and unverified and nudges_left > 0:
+                        nudges_left -= 1
+                        hint = (
+                            FAILED_VERIFY_HINT.format(
+                                command=last_failed_command, exit_code=last_failed_exit
+                            )
+                            if last_failed_command
+                            else VERIFY_HINT.format(changed=len(set(changed)))
+                        )
+                        self.callbacks.emit("on_tool_start", call)
+                        self.callbacks.emit(
+                            "on_tool_result",
+                            call,
+                            ToolResult(
+                                False,
+                                error="finish refused: the changes have not been verified yet",
+                                title="finish (blocked)",
+                            ),
+                        )
+                        self.callbacks.emit("on_status", "Verification required before finishing")
+                        self.history.append(ChatMessage.user(hint))
+                        consecutive_failures = 0
+                        continue
+
+                    if require_verification and unverified:
+                        summary += (
+                            "\n\n> Warning: Agent3 could not confirm these changes - "
+                            "no verification command succeeded after the last edit."
+                        )
                     result.stop_reason = AgentStopReason.FINISHED
                     result.final_message = summary
                     self.callbacks.emit("on_tool_start", call)
@@ -305,6 +357,23 @@ class AgentLoop:
                     consecutive_failures += 1
                     self.usage.record_error(tool_result.error, where=f"tool:{call.name}")
 
+                # Track what still needs proving.
+                if tool_result.ok and call.name in mutating:
+                    touched = str(tool_result.data.get("path") or call.args.get("path") or "")
+                    if touched:
+                        changed.append(touched)
+                    unverified = True
+                    verified_with = ""
+                elif call.name == "run_command":
+                    if tool_result.ok:
+                        unverified = False
+                        verified_with = str(call.args.get("command") or "")
+                        last_failed_command = ""
+                        last_failed_exit = 0
+                    else:
+                        last_failed_command = str(call.args.get("command") or "")
+                        last_failed_exit = int(tool_result.data.get("exit_code") or 1)
+
                 observation = truncate_to_tokens(
                     tool_result.observation(self.settings.max_output_chars), 6000
                 )
@@ -329,6 +398,9 @@ class AgentLoop:
 
         result.duration_ms = int((time.monotonic() - started) * 1000)
         result.transcript = list(self.history)
+        result.changed_files = sorted(set(changed))
+        result.verified = bool(changed) and not unverified
+        result.verification_command = verified_with
         if not result.final_message:
             result.final_message = self._fallback_message(result)
         self.callbacks.emit("on_status", f"Done ({result.stop_reason.value})")

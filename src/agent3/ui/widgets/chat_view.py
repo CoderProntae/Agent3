@@ -10,7 +10,6 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
-    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -19,7 +18,18 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from agent3.ui.diff_render import (
+    diff_badge_text,
+    guess_detail_kind,
+    render_diff_badge,
+    render_diff_html,
+    render_output_html,
+)
 from agent3.ui.theme import COLORS, mono_font, role_colors
+from agent3.workspace.diffing import diff_stats
+
+#: Tallest an action-card detail pane may grow before it scrolls internally.
+DETAILS_MAX_HEIGHT = 340
 
 MARKDOWN_CSS = f"""
     body {{ color: {COLORS.text}; }}
@@ -150,6 +160,14 @@ class ActionCard(QFrame):
         self._title.setStyleSheet(f"color: {COLORS.text};")
         header.addWidget(self._title, 1)
 
+        self._badge = QLabel("")
+        self._badge.setTextFormat(Qt.TextFormat.RichText)
+        self._badge.setVisible(False)
+        badge_font = QFont()
+        badge_font.setBold(True)
+        self._badge.setFont(badge_font)
+        header.addWidget(self._badge, 0)
+
         self._meta = QLabel("")
         self._meta.setStyleSheet(f"color: {COLORS.text_faint};")
         header.addWidget(self._meta, 0)
@@ -168,26 +186,80 @@ class ActionCard(QFrame):
         self._subtitle.setVisible(bool(subtitle))
         outer.addWidget(self._subtitle)
 
-        self._details = QPlainTextEdit()
+        # Rich detail pane: a real diff review for file changes, colourised
+        # console output for commands.
+        self._details = QTextBrowser()
         self._details.setReadOnly(True)
         self._details.setFont(mono_font(9))
         self._details.setVisible(False)
-        self._details.setMaximumHeight(280)
+        self._details.setMinimumHeight(28)
+        self._details.setMaximumHeight(DETAILS_MAX_HEIGHT)
+        self._details.document().documentLayout().documentSizeChanged.connect(
+            lambda _size: self._fit_details()
+        )
+        self._details.setLineWrapMode(QTextBrowser.LineWrapMode.NoWrap)
+        self._details.setFrameShape(QFrame.Shape.NoFrame)
         self._details.setStyleSheet(
-            f"QPlainTextEdit {{ background-color: {COLORS.bg}; border: 1px solid {COLORS.border};"
+            f"QTextBrowser {{ background-color: {COLORS.bg}; border: 1px solid {COLORS.border};"
             f" border-radius: 6px; color: {COLORS.text_dim}; }}"
         )
         outer.addWidget(self._details)
 
     # ------------------------------------------------------------ updates
+    def _fit_details(self) -> None:
+        """Shrink-wrap the detail pane around its content."""
+        document = self._details.document()
+        document.setTextWidth(max(120, self._details.viewport().width()))
+        height = int(document.size().height()) + 12
+        self._details.setFixedHeight(max(28, min(height, DETAILS_MAX_HEIGHT)))
+
     def set_subtitle(self, text: str) -> None:
         self._subtitle.setText(text)
         self._subtitle.setVisible(bool(text))
 
-    def set_details(self, text: str) -> None:
+    def set_details(self, text: str, *, kind: str = "auto") -> None:
+        """Fill the collapsible detail pane.
+
+        ``kind`` is ``diff``, ``output`` or ``auto`` (sniff the content).
+        A diff is rendered as a colourised review table with old/new line
+        numbers; anything else is rendered as console output with errors in
+        red and passing tests in green.
+        """
         self._details_text = text or ""
-        self._details.setPlainText(self._details_text[:40000])
-        self._toggle.setVisible(bool(self._details_text))
+        if not self._details_text:
+            self._details.setHtml("")
+            self._toggle.setVisible(False)
+            return
+        resolved = guess_detail_kind(self._details_text) if kind == "auto" else kind
+        if resolved == "diff":
+            self.set_diff(self._details_text)
+            return
+        self._details.setHtml(render_output_html(self._details_text[:60000]))
+        self._toggle.setVisible(True)
+
+    def set_diff(self, unified: str) -> None:
+        """Render *unified* as a green/red review table and show the badge."""
+        self._details_text = unified or ""
+        if not self._details_text.strip():
+            self._details.setHtml("")
+            self._toggle.setVisible(False)
+            return
+        self._details.setHtml(render_diff_html(self._details_text[:200000]))
+        stats = diff_stats(self._details_text)
+        badge = render_diff_badge(stats)
+        if badge:
+            self._badge.setText(badge)
+            self._badge.setVisible(True)
+        self._toggle.setVisible(True)
+        self._toggle.setText("Hide diff" if self._toggle.isChecked() else "Diff")
+
+    @property
+    def details_text(self) -> str:
+        return self._details_text
+
+    def badge_text(self) -> str:
+        """Plain-text form of the +/- badge (used by tests)."""
+        return diff_badge_text(self._details_text)
 
     def set_status(self, status: str, meta: str = "") -> None:
         """``running`` | ``success`` | ``error`` | ``blocked``."""
@@ -198,7 +270,7 @@ class ActionCard(QFrame):
             "error": COLORS.danger,
             "blocked": COLORS.danger,
         }
-        glyphs = {"running": "●", "success": "✓", "error": "✕", "blocked": "⛔"}
+        glyphs = {"running": "●", "success": "✓", "error": "✕", "blocked": "!"}
         color = colors.get(status, COLORS.text_dim)
         self._icon.setText(glyphs.get(status, "●"))
         self._icon.setStyleSheet(f"color: {color}; font-size: 13px;")
@@ -211,7 +283,11 @@ class ActionCard(QFrame):
 
     def _on_toggle(self, checked: bool) -> None:
         self._details.setVisible(checked)
-        self._toggle.setText("Hide" if checked else "Details")
+        is_diff = guess_detail_kind(self._details_text) == "diff"
+        if checked:
+            self._toggle.setText("Hide diff" if is_diff else "Hide")
+        else:
+            self._toggle.setText("Diff" if is_diff else "Details")
 
 
 class ChatView(QScrollArea):

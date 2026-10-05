@@ -14,6 +14,7 @@ from agent3.workspace.diffing import (
     parse_unified_diff,
     side_by_side,
 )
+from agent3.agent.tools import ToolCall, ToolRegistry
 from agent3.workspace.fs import WorkspaceFS, WorkspaceSecurityError
 from agent3.workspace.terminal import CommandBlockedError, CommandRunner
 
@@ -235,3 +236,116 @@ class TestGitRepo:
         summary = git_repo.summary()
         assert summary["repo"] is True
         assert summary["dirty"] is False
+
+
+class TestNewAgentTools:
+    """End to end coverage for ``view_outline`` and ``patch_file``."""
+
+    def test_view_outline_is_cheaper_than_reading(self, tool_context):
+        body = (
+            '"""Service layer."""\n\n'
+            "import os\n\n\n"
+            "class Service:\n"
+            '    """Does work."""\n\n'
+            "    def start(self, port: int = 8000) -> None:\n"
+            '        """Start listening."""\n'
+            + "        pass\n" * 60
+            + "\n\ndef helper(x: int) -> int:\n    return x\n"
+        )
+        tool_context.fs.write_text("svc.py", body)
+        registry = ToolRegistry()
+
+        outline = registry.execute(ToolCall("view_outline", {"path": "svc.py"}), tool_context)
+        full = registry.execute(ToolCall("read_file", {"path": "svc.py"}), tool_context)
+
+        assert outline.ok
+        assert "class Service" in outline.output
+        assert "start(self, port: int=8000) -> None" in outline.output
+        assert "Start listening." in outline.output
+        assert "helper" in outline.output
+        assert len(outline.output) < len(full.output) / 2
+        assert outline.data["language"] == "python"
+
+    def test_view_outline_rejects_a_directory(self, tool_context):
+        tool_context.fs.mkdir("pkg")
+        result = ToolRegistry().execute(ToolCall("view_outline", {"path": "pkg"}), tool_context)
+        assert not result.ok
+        assert "list_files" in result.error
+
+    def test_patch_file_changes_three_places_at_once(self, tool_context):
+        original = "\n".join(f"line {i}" for i in range(1, 31)) + "\n"
+        tool_context.fs.write_text("big.txt", original)
+        patch = (
+            "--- a/big.txt\n+++ b/big.txt\n"
+            "@@ -1,4 +1,4 @@\n line 1\n line 2\n-line 3\n+LINE THREE\n line 4\n"
+            "@@ -13,3 +13,3 @@\n line 13\n-line 14\n+LINE FOURTEEN\n line 15\n"
+            "@@ -27,3 +27,3 @@\n line 27\n-line 28\n+LINE TWENTY EIGHT\n line 29\n"
+        )
+        result = ToolRegistry().execute(
+            ToolCall("patch_file", {"path": "big.txt", "patch": patch}), tool_context
+        )
+        assert result.ok, result.error
+        assert result.data["hunks"] == 3
+        assert result.data["added"] == 3 and result.data["removed"] == 3
+        body = tool_context.fs.read_text("big.txt")
+        assert "LINE THREE" in body and "LINE FOURTEEN" in body and "LINE TWENTY EIGHT" in body
+        assert "line 3\n" not in body
+        assert result.diff.startswith("---")
+
+    def test_patch_file_infers_the_path_from_the_header(self, tool_context):
+        tool_context.fs.write_text("app.py", "old\n")
+        patch = "--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-old\n+new\n"
+        result = ToolRegistry().execute(ToolCall("patch_file", {"patch": patch}), tool_context)
+        assert result.ok, result.error
+        assert tool_context.fs.read_text("app.py") == "new\n"
+
+    def test_patch_file_reports_an_unapplicable_hunk(self, tool_context):
+        tool_context.fs.write_text("app.py", "completely different\n")
+        patch = "@@ -1,2 +1,2 @@\n-old\n+new\n context\n"
+        result = ToolRegistry().execute(
+            ToolCall("patch_file", {"path": "app.py", "patch": patch}), tool_context
+        )
+        assert not result.ok
+        assert "hunk #1" in result.error
+        assert "Re-read the file" in result.error
+        assert tool_context.fs.read_text("app.py") == "completely different\n"
+
+    def test_patch_file_requires_a_real_diff(self, tool_context):
+        tool_context.fs.write_text("app.py", "x\n")
+        result = ToolRegistry().execute(
+            ToolCall("patch_file", {"path": "app.py", "patch": "just change it"}), tool_context
+        )
+        assert not result.ok
+        assert "unified diff" in result.error
+
+    def test_patch_file_refuses_a_missing_file(self, tool_context):
+        result = ToolRegistry().execute(
+            ToolCall("patch_file", {"path": "ghost.py", "patch": "@@ -1 +1 @@\n-a\n+b\n"}),
+            tool_context,
+        )
+        assert not result.ok
+        assert "write_file" in result.error
+
+    def test_patch_file_stays_inside_the_workspace(self, tool_context):
+        """The registry turns the sandbox violation into a clean tool error."""
+        patch = "@@ -1 +1 @@\n-a\n+b\n"
+        result = ToolRegistry().execute(
+            ToolCall("patch_file", {"path": "../escape.txt", "patch": patch}), tool_context
+        )
+        assert not result.ok
+        assert "security violation" in result.error
+
+    def test_view_outline_stays_inside_the_workspace(self, tool_context):
+        result = ToolRegistry().execute(
+            ToolCall("view_outline", {"path": "../../etc/passwd"}), tool_context
+        )
+        assert not result.ok
+        assert "security violation" in result.error
+
+    def test_run_command_refuses_interactive_input(self, tool_context):
+        result = ToolRegistry().execute(
+            ToolCall("run_command", {"command": "npm init"}), tool_context
+        )
+        assert not result.ok
+        assert result.data["interactive"] is True
+        assert "npm init -y" in result.output

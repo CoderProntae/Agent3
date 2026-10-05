@@ -115,13 +115,60 @@ user instruction
 |---|---|
 | `project_overview` | File tree, file-type statistics and git state in one shot |
 | `list_files` / `read_file` | Browse and read (optionally a line range) |
+| `view_outline` | Structural map of a file - classes, functions, signatures, docstrings, line numbers - without spending the context on its body. Python via `ast`, 15 other languages via scanners |
 | `write_file` | Create or fully overwrite a file (returns a unified diff) |
 | `edit_file` | Anchored search/replace with a whitespace-tolerant fallback |
+| `patch_file` | Apply a multi-hunk unified diff atomically. Hunks are located by context, so later hunks still land after earlier ones shift the line numbers |
 | `delete_file` / `rename_file` / `make_directory` | Filesystem mutations |
 | `search_code` | Literal or regex grep across the workspace |
-| `run_command` | Shell execution with capture, timeout and a destructive-command deny-list |
+| `run_command` | Shell execution with capture, timeout, a destructive-command deny-list and an interactive-command trap |
 | `git` | `status · init · add · commit · diff · log · branch · checkout · push · pull` |
-| `finish` | Ends the run with a summary |
+| `finish` | Ends the run - refused until the changes have been verified |
+
+### Cheap exploration
+
+`read_file` on a 900-line module costs thousands of context tokens to answer
+"which methods does this class have?". `view_outline` answers the same question
+in a few dozen lines, and the model then reads only the range it needs. The
+system prompt requires it for anything over ~150 lines.
+
+### Editing in one shot
+
+Three changes in one file used to mean three `edit_file` calls, with the model
+guessing the file's state between each one - the classic drift failure of small
+local models. `patch_file` takes a real unified diff and applies every hunk in a
+single atomic step; a hunk that cannot be placed is reported by number, with the
+context it expected, and nothing is written.
+
+### No command may wait for a human
+
+Nobody can answer a prompt inside an autonomous agent, so a command that asks a
+question would simply burn the 240 s timeout. Two layers prevent that:
+
+1. **Pre-flight deny list** - `npm init`, `apt-get install`, `git commit`
+   without `-m`, `vim`, `less`, a bare `python` REPL and ~15 more patterns are
+   refused *before* the process is spawned, and the model is told the
+   non-interactive form to use instead (`npm init -y`, ...).
+2. **Runtime stall detector** - output is read as raw chunks rather than lines,
+   so a prompt with no trailing newline (`Continue? [y/N] `) is still visible.
+   If output stops for 15 s *and* the tail looks like a question, the process
+   tree is killed and the model gets the remediation advice. A silent compiler
+   is never mistaken for a prompt.
+
+The child environment also advertises that no human is present:
+`CI=1`, `DEBIAN_FRONTEND=noninteractive`, `GIT_TERMINAL_PROMPT=0`,
+`GIT_EDITOR=true`, `PIP_NO_INPUT=1`, `NPM_CONFIG_YES=true`.
+
+### Definition of done
+
+`finish` is not a free action. If files changed during the run and no command
+has succeeded since the last edit, the loop **refuses the call once** and pushes
+the model back to its test command (`pytest -q`, `npm test`, `go test ./...`, a
+build or an import check). A failing verification produces a different,
+sharper hint. A stubborn model is never deadlocked: the second attempt is
+accepted but the summary is stamped with a visible warning, and
+`AgentRunResult` exposes `verified`, `verification_command` and `changed_files`.
+Set `agent.require_verification = false` in `config.json` to opt out.
 
 ### Safety model
 
