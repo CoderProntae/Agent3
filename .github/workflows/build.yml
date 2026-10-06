@@ -1,0 +1,308 @@
+name: Build & Release
+
+# ---------------------------------------------------------------------------
+# Pipeline
+#   1. test          - ubuntu, full pytest suite (headless Qt via offscreen)
+#   2. build-windows - freezes Agent3.exe (PyInstaller)
+#   3. release       - publishes a DRAFT GitHub Release with the zipped build
+#
+# Trigger a build manually from the "Actions" tab (workflow_dispatch) and tick
+# "create_release" to get a downloadable release draft, or simply push a tag
+# such as v1.0.0.
+# ---------------------------------------------------------------------------
+
+on:
+  # Pushes to long-lived branches and version tags. Feature branches are
+  # covered by their pull request, so this never double-builds a commit.
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: "Publish a draft GitHub Release with the built executables"
+        type: boolean
+        default: false
+      release_tag:
+        description: "Tag for the manual release (default: build-<run number>)"
+        type: string
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.11"
+  QT_QPA_PLATFORM: offscreen
+
+jobs:
+  # =========================================================== 1. TEST SUITE
+  test:
+    name: Tests (ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      # Qt needs a handful of X/GL shared objects even in offscreen mode.
+      # Debian mirrors occasionally stall, so every apt call is bounded by a
+      # timeout and retried; a permanent failure only downgrades the run (the
+      # GUI tests skip themselves when PySide6 cannot be imported).
+      - name: Install Qt runtime libraries
+        id: qt_libs
+        timeout-minutes: 8
+        continue-on-error: true
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -x
+          APT_OPTS="-o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o DPkg::Lock::Timeout=60"
+          for attempt in 1 2 3; do
+            echo "::group::apt attempt $attempt"
+            if timeout 120 sudo -E apt-get $APT_OPTS update \
+               && timeout 180 sudo -E apt-get $APT_OPTS install -y --no-install-recommends \
+                    libgl1 libegl1 libxkbcommon-x11-0 libdbus-1-3 libfontconfig1 \
+                    libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
+                    libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0; then
+              echo "::endgroup::"
+              echo "Qt runtime libraries installed."
+              exit 0
+            fi
+            echo "::endgroup::"
+            echo "apt attempt $attempt failed, retrying in 15s..."
+            sleep 15
+          done
+          echo "::warning::Could not install the Qt runtime libraries; GUI tests will be skipped."
+          exit 1
+
+      - name: Report Qt availability
+        if: steps.qt_libs.outcome != 'success'
+        run: echo "::warning::Qt system libraries unavailable on this runner - the GUI test module will skip itself."
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Configure git identity (needed by the git integration tests)
+        run: |
+          git config --global user.email "ci@agent3.local"
+          git config --global user.name "Agent3 CI"
+          git config --global init.defaultBranch main
+
+      - name: Run the test suite
+        run: pytest -q --cov=agent3 --cov-report=xml --cov-report=term-missing
+
+      - name: Byte-compile every module (syntax gate)
+        run: python -m compileall -q src
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-report
+          path: coverage.xml
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # ====================================================== 2. WINDOWS BINARIES
+  build-windows:
+    name: Build Windows executables
+    runs-on: windows-latest
+    needs: test
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Generate Windows version resource
+        run: python packaging/make_version_file.py
+
+      - name: Freeze Agent3.exe
+        run: python -m PyInstaller packaging/Agent3.spec --noconfirm --clean
+
+      - name: Verify the artifacts
+        shell: pwsh
+        run: |
+          $expected = @("dist/Agent3.exe")
+          foreach ($file in $expected) {
+            if (-not (Test-Path $file)) { throw "missing build artifact: $file" }
+            $size = (Get-Item $file).Length / 1MB
+            Write-Host ("{0} -> {1:N1} MiB" -f $file, $size)
+            if ($size -lt 10) { throw "$file looks truncated ($size MiB)" }
+          }
+
+      # The unit tests run against the source tree, so they cannot prove that
+      # a *frozen* binary starts. These steps execute the real executables:
+      # --self-test builds the full Qt widget tree off-screen and exits 0.
+      # A missing hidden import, a wrongly excluded module (e.g. shiboken6) or
+      # an absent bundled resource fails the build here instead of on a user's
+      # machine.
+      #
+      # Both binaries are built windowed (no console), so their stdout goes
+      # nowhere: the verdict is taken from the process exit code and from the
+      # line the application writes into its own log file.
+      - name: Smoke test the frozen executables
+        shell: pwsh
+        timeout-minutes: 8
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          function Invoke-Exe {
+            param([string]$Exe, [string[]]$ExeArgs, [string]$DataHome)
+
+            if (Test-Path $DataHome) { Remove-Item -Recurse -Force $DataHome }
+            New-Item -ItemType Directory -Force -Path $DataHome | Out-Null
+            $env:AGENT3_HOME = $DataHome
+
+            Write-Host "--- $Exe $($ExeArgs -join ' ')"
+            $proc = Start-Process -FilePath $Exe -ArgumentList $ExeArgs -Wait -PassThru -NoNewWindow
+            $code = $proc.ExitCode
+
+            $log = Join-Path $DataHome "logs/agent3.log"
+            if (Test-Path $log) {
+              Write-Host "--- log ---"
+              Get-Content $log | ForEach-Object { Write-Host "    $_" }
+            } else {
+              Write-Host "    (no log file produced)"
+            }
+
+            if ($code -ne 0) {
+              throw "$Exe $($ExeArgs -join ' ') exited with $code"
+            }
+            return $log
+          }
+
+          # 1. --version must not even need a display.
+          Invoke-Exe -Exe "./dist/Agent3.exe" -ExeArgs @("--version") `
+                     -DataHome (Join-Path $env:RUNNER_TEMP "smoke-agent-version") | Out-Null
+
+          # 2. --self-test builds every widget, every icon and every Qt plugin.
+          $log = Invoke-Exe -Exe "./dist/Agent3.exe" -ExeArgs @("--self-test") `
+                            -DataHome (Join-Path $env:RUNNER_TEMP "smoke-agent")
+          if (-not (Select-String -Path $log -Pattern "self test OK" -Quiet)) {
+            throw "Agent3.exe did not report a successful self test"
+          }
+
+          Write-Host "The executable starts and builds its UI correctly."
+
+      - name: Stage the release folder
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Copy-Item dist/Agent3.exe release/
+          Copy-Item README.md release/
+          Copy-Item LICENSE release/
+          @"
+          Agent3 - local autonomous AI coding workspace
+          =============================================
+
+          Contents
+          --------
+          Agent3.exe             the desktop application (chat, editor, terminal, git)
+
+          Requirements
+          ------------
+          1. Install Ollama:  https://ollama.com
+          2. Serve it on port 11435 (Agent3's default endpoint):
+
+                 set OLLAMA_HOST=127.0.0.1:11435
+                 ollama serve
+
+          3. Pull a model, e.g.:
+
+                 ollama pull qwen2.5-coder:7b
+
+          4. Start Agent3.exe, open File > Settings to pick the model, then
+             open a workspace folder with Ctrl+O and describe your task.
+
+          Agent3.exe is portable: configuration, logs and chat history live
+          in %APPDATA%\Agent3.
+          "@ | Out-File -Encoding utf8 release/INSTALL.txt
+          Compress-Archive -Path release/* -DestinationPath Agent3-windows-x64.zip -Force
+
+      - name: Upload Agent3.exe
+        uses: actions/upload-artifact@v7
+        with:
+          name: Agent3-windows-exe
+          path: dist/Agent3.exe
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Upload the full release bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: Agent3-windows-x64-bundle
+          path: Agent3-windows-x64.zip
+          retention-days: 30
+          if-no-files-found: error
+
+  # ============================================================= 3. RELEASE
+  release:
+    name: Draft GitHub Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: build-windows
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.create_release
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download the built bundle
+        uses: actions/download-artifact@v8
+        with:
+          pattern: "*windows*"
+          merge-multiple: true
+          path: artifacts
+
+      - name: Resolve the release tag
+        id: tag
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "value=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          elif [ -n "${{ inputs.release_tag }}" ]; then
+            echo "value=${{ inputs.release_tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=build-${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -la artifacts
+          gh release create "${{ steps.tag.outputs.value }}" \
+            --draft \
+            --title "Agent3 ${{ steps.tag.outputs.value }}" \
+            --notes "Automated build from commit ${GITHUB_SHA::8}.
+
+          **Downloads**
+          - \`Agent3-windows-x64.zip\` - the executable plus install notes
+          - \`Agent3.exe\` - the desktop application
+
+          Agent3 talks to a local Ollama server on \`http://localhost:11435\`." \
+            artifacts/* \
+          || gh release upload "${{ steps.tag.outputs.value }}" artifacts/* --clobber

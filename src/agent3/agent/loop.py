@@ -1,0 +1,561 @@
+"""The autonomous reason -> act -> observe loop with self-correction.
+
+The loop is pure Python and completely UI agnostic: every piece of progress is
+reported through :class:`AgentCallbacks`, which the Qt layer binds to signals.
+That also makes the whole thing unit-testable with a fake LLM client.
+"""
+
+from __future__ import annotations
+
+import threading
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Callable, Dict, List, Optional, Sequence
+
+from agent3.agent.prompts import (
+    FAILED_VERIFY_HINT,
+    PROCESS_HINT,
+    SYNTAX_HINT,
+    TASKS_HINT,
+    LOOP_HINT,
+    NO_TOOL_HINT,
+    RETRY_HINT,
+    VERIFY_HINT,
+    build_observation,
+    build_environment_block,
+    build_stable_prefix,
+    build_user_request,
+)
+from agent3.agent.tools import ToolCall, ToolContext, ToolRegistry, ToolResult, parse_tool_calls, strip_tool_calls
+from agent3.core.config import AgentSettings
+from agent3.core.logging_setup import get_logger, log_exception
+from agent3.llm.messages import ChatMessage, Role
+from agent3.llm.ollama_client import OllamaCancelled, OllamaClient, OllamaError
+from agent3.llm.tokenizer import count_message_tokens, truncate_to_tokens
+
+logger = get_logger(__name__)
+
+
+class AgentStopReason(str, Enum):
+    """Why a run ended."""
+
+    FINISHED = "finished"
+    NO_TOOL_CALL = "no_tool_call"
+    MAX_ITERATIONS = "max_iterations"
+    CANCELLED = "cancelled"
+    ERROR = "error"
+
+
+@dataclass
+class AgentCallbacks:
+    """Observer hooks; every field is optional."""
+
+    on_status: Optional[Callable[[str], None]] = None
+    on_assistant_delta: Optional[Callable[[str], None]] = None
+    #: Reasoning fragments, streamed separately from the answer.
+    on_thinking_delta: Optional[Callable[[str], None]] = None
+    #: The task list changed (added, updated, completed).
+    on_tasks_changed: Optional[Callable[[object], None]] = None
+    on_assistant_message: Optional[Callable[[str], None]] = None
+    on_tool_start: Optional[Callable[[ToolCall], None]] = None
+    on_tool_result: Optional[Callable[[ToolCall, ToolResult], None]] = None
+    on_error: Optional[Callable[[str], None]] = None
+
+    def emit(self, hook: str, *args) -> None:
+        """Invoke a hook, swallowing UI exceptions so the loop never dies."""
+        callback = getattr(self, hook, None)
+        if callback is None:
+            return
+        try:
+            callback(*args)
+        except Exception:  # pragma: no cover - defensive around UI code
+            logger.debug("callback %s raised", hook, exc_info=True)
+
+
+@dataclass
+class AgentRunResult:
+    """Everything that happened during one run."""
+
+    stop_reason: AgentStopReason
+    final_message: str = ""
+    iterations: int = 0
+    tool_calls: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    duration_ms: int = 0
+    error: str = ""
+    transcript: List[ChatMessage] = field(default_factory=list)
+    #: Workspace-relative paths written during the run.
+    changed_files: List[str] = field(default_factory=list)
+    #: True when a command succeeded after the final file modification.
+    verified: bool = False
+    #: The command used as proof, when there is one.
+    verification_command: str = ""
+    #: Reasoning trace of the last step, when the model emitted one.
+    thinking: str = ""
+    #: Files the agent left with a syntax error it never repaired.
+    broken_files: List[str] = field(default_factory=list)
+
+    @property
+    def total_tokens(self) -> int:
+        return self.prompt_tokens + self.completion_tokens
+
+    @property
+    def ok(self) -> bool:
+        return self.stop_reason in (AgentStopReason.FINISHED, AgentStopReason.NO_TOOL_CALL)
+
+
+class AgentLoop:
+    """Drives the model and the tools for one autonomous run."""
+
+    def __init__(
+        self,
+        client: OllamaClient,
+        registry: ToolRegistry,
+        context: ToolContext,
+        settings: Optional[AgentSettings] = None,
+        *,
+        model: Optional[str] = None,
+        callbacks: Optional[AgentCallbacks] = None,
+        extra_instructions: str = "",
+    ) -> None:
+        self.client = client
+        self.registry = registry
+        self.context = context
+        self.settings = settings or AgentSettings()
+        self.model = model or client.settings.model
+        self.callbacks = callbacks or AgentCallbacks()
+        self.extra_instructions = extra_instructions
+        self.history: List[ChatMessage] = []
+        self._cancel = threading.Event()
+        #: Guards the "model ignored thinking: off" notice so it is
+        #: shown once per loop rather than on every step.
+        self._think_warning_sent = False
+        #: Frozen system prompt for the current run (see :meth:`system_prompt`).
+        self._system_prompt: Optional[str] = None
+        #: Left edge of the context window. Monotonic within a conversation
+        #: so the cached prefix survives; see :meth:`_window`.
+        self._window_start = 0
+        #: Reasoning spec forwarded to Ollama's ``think`` field. ``None`` means
+        #: "use whatever the connection settings say".
+        self.think: Optional[str] = None
+        # The tool layer owns the plan and the undo buffer; make sure they
+        # exist up front so the UI can bind to them before the first run.
+        self.context.task_list()
+        self.context.snapshot_store()
+        if self.context.on_tasks_changed is None:
+            self.context.on_tasks_changed = lambda tasks: self.callbacks.emit(
+                "on_tasks_changed", tasks
+            )
+
+    # ------------------------------------------------------------- control
+    def cancel(self) -> None:
+        """Request cooperative cancellation of the current run."""
+        self._cancel.set()
+        try:
+            self.context.runner.terminate()
+        except Exception:  # pragma: no cover
+            logger.debug("terminating runner failed", exc_info=True)
+
+    @property
+    def cancel_event(self) -> threading.Event:
+        return self._cancel
+
+    def reset(self) -> None:
+        """Forget the conversation (new session)."""
+        self.history.clear()
+        self._cancel.clear()
+        self._window_start = 0
+        self.refresh_system_prompt()
+
+    def load_history(self, messages: Sequence[ChatMessage]) -> None:
+        """Restore a persisted conversation."""
+        self.history = [m for m in messages if m.role is not Role.SYSTEM]
+        self._window_start = 0
+
+    # -------------------------------------------------------------- prompt
+    def system_prompt(self) -> str:
+        """The system message - identical on every step, run and session.
+
+        An inference server can only reuse its KV cache for a common
+        *prefix*. Message 0 therefore has to be invariant, and for a long
+        time it was not: it carried the workspace tree and the git state,
+        both of which change the moment the agent writes a file. One
+        `write_file` invalidated the whole conversation.
+
+        The workspace snapshot now travels as a conversation turn
+        (:func:`build_environment_block`), appended where new tokens go
+        anyway, so nothing here ever changes while a workspace is mounted.
+        """
+        if self._system_prompt is None:
+            self._system_prompt = self._render_system_prompt()
+        return self._system_prompt
+
+    def refresh_system_prompt(self) -> None:
+        """Drop the cached render (tools or project instructions changed)."""
+        self._system_prompt = None
+
+    def _render_system_prompt(self) -> str:
+        prompt = build_stable_prefix(self.registry.describe())
+        if self.extra_instructions.strip():
+            prompt += (
+                f"\n## Additional project instructions\n"
+                f"{self.extra_instructions.strip()}\n"
+            )
+        return prompt
+
+    def environment_block(self) -> str:
+        """Snapshot of the workspace, rendered fresh at the start of a run."""
+        fs = self.context.fs
+        try:
+            tree = fs.tree_text(max_depth=3, max_entries=300)
+        except Exception:  # pragma: no cover - unreadable workspace
+            tree = "(workspace tree unavailable)"
+        git_state = "not a git repository"
+        try:
+            if self.context.git.is_repo():
+                branch = self.context.git.current_branch() or "detached"
+                dirty = "dirty" if self.context.git.is_dirty() else "clean"
+                git_state = f"yes (branch: {branch}, {dirty})"
+        except Exception:  # pragma: no cover
+            pass
+        return build_environment_block(
+            workspace=str(fs.root), tree=tree, git_state=git_state
+        )
+
+    def _window(self) -> List[ChatMessage]:
+        """System prompt + a bounded, *prefix-stable* slice of the history.
+
+        The obvious bounded window - ``history[-window:]`` - drops one
+        message per step once the conversation is long enough. Every drop
+        shifts the whole remaining context, which destroys the cached prefix
+        on *every single step*: the same full re-evaluation the static
+        system prompt was meant to avoid.
+
+        So the window has a fixed left edge that only moves in batches. It
+        grows until it exceeds the budget, then jumps back to 60 % of it.
+        One expensive step every ~40 % of a window, instead of each one.
+        """
+        window = max(6, int(self.settings.history_window))
+        if len(self.history) - self._window_start > window:
+            keep = max(6, int(window * 0.6))
+            self._window_start = max(self._window_start, len(self.history) - keep)
+        self._window_start = min(self._window_start, max(0, len(self.history) - 1))
+        tail = self.history[self._window_start :]
+        return [ChatMessage.system(self.system_prompt()), *tail]
+
+    # ----------------------------------------------------------------- run
+    def run(self, user_message: str, *, context_hint: str = "") -> AgentRunResult:
+        """Execute one autonomous run for *user_message*."""
+        self._cancel.clear()
+        started = time.monotonic()
+        result = AgentRunResult(stop_reason=AgentStopReason.ERROR)
+
+        # The workspace snapshot is *appended*, never edited into message 0:
+        # a fresh tree then costs the tokens of the tree, not the tokens of
+        # the entire conversation.
+        self.history.append(
+            ChatMessage.user(
+                build_user_request(
+                    user_message,
+                    context=context_hint or None,
+                    environment=self.environment_block(),
+                )
+            )
+        )
+
+        max_iterations = max(1, int(self.settings.max_iterations))
+        repeated: Dict[str, int] = {}
+        consecutive_failures = 0
+
+        # --- "definition of done" bookkeeping -----------------------------
+        #: Tools whose success leaves the workspace in an unverified state.
+        mutating = {"write_file", "edit_file", "patch_file", "delete_file", "rename_file"}
+        changed: List[str] = []
+        unverified = False          # files changed, nothing run since
+        verified_with = ""          # the command that proved the work
+        last_failed_command = ""
+        last_failed_exit = 0
+        nudges_left = max(0, int(getattr(self.settings, "verification_nudges", 1)))
+        require_verification = bool(getattr(self.settings, "require_verification", True))
+        #: path -> syntax report, for files the agent left unparseable.
+        broken: Dict[str, str] = {}
+        syntax_nudges = 2
+        task_nudges = 1
+
+        try:
+            for iteration in range(1, max_iterations + 1):
+                if self._cancel.is_set():
+                    result.stop_reason = AgentStopReason.CANCELLED
+                    break
+                result.iterations = iteration
+
+                messages = self._window()
+                self.callbacks.emit("on_status", f"Thinking (step {iteration}/{max_iterations})")
+                try:
+                    text, usage = self.client.chat(
+                        messages,
+                        model=self.model,
+                        cancel=self._cancel,
+                        on_delta=lambda delta: self.callbacks.emit("on_assistant_delta", delta),
+                        think=self.think,
+                        on_thinking=lambda delta: self.callbacks.emit("on_thinking_delta", delta),
+                    )
+                    result.thinking = getattr(self.client, "last_thinking", "")
+                    self._warn_if_think_ignored()
+                except OllamaCancelled:
+                    result.stop_reason = AgentStopReason.CANCELLED
+                    break
+                except OllamaError as exc:
+                    trace = log_exception(logger, exc, "LLM call failed")
+                    consecutive_failures += 1
+                    self.callbacks.emit("on_error", f"Ollama error: {exc}")
+                    if consecutive_failures > max(1, int(self.settings.self_correction_retries)):
+                        result.stop_reason = AgentStopReason.ERROR
+                        result.error = str(exc)
+                        break
+                    self.history.append(
+                        ChatMessage.user(
+                            f"The inference server returned an error:\n{trace[-800:]}\n\n{RETRY_HINT}"
+                        )
+                    )
+                    continue
+
+                result.prompt_tokens += usage.prompt_tokens
+                result.completion_tokens += usage.completion_tokens
+
+                self.history.append(ChatMessage.assistant(text))
+                prose = strip_tool_calls(text)
+                if prose:
+                    self.callbacks.emit("on_assistant_message", prose)
+
+                calls = parse_tool_calls(text, self.registry.names())
+                if not calls:
+                    # No action: treat a non-trivial answer as the final reply.
+                    if prose and iteration > 1:
+                        result.stop_reason = AgentStopReason.NO_TOOL_CALL
+                        result.final_message = prose
+                        break
+                    self.history.append(ChatMessage.user(NO_TOOL_HINT))
+                    consecutive_failures += 1
+                    if consecutive_failures > max(2, int(self.settings.self_correction_retries) + 1):
+                        result.stop_reason = AgentStopReason.NO_TOOL_CALL
+                        result.final_message = prose or text.strip()
+                        break
+                    continue
+
+                call = calls[0]
+                if call.name == "finish":
+                    summary = str(call.args.get("summary") or call.args.get("message") or prose or "Task complete.")
+
+                    # Gate 1 - broken code. A file that does not parse is not
+                    # finished work, whatever the summary claims.
+                    if broken and syntax_nudges > 0:
+                        syntax_nudges -= 1
+                        listing = "\n\n".join(
+                            f"{path}:\n{report.strip()[:600]}" for path, report in broken.items()
+                        )
+                        self._refuse_finish(
+                            call,
+                            "finish refused: files with syntax errors",
+                            SYNTAX_HINT.format(files=listing),
+                            f"Broken file(s): {', '.join(broken)}",
+                        )
+                        consecutive_failures = 0
+                        continue
+
+                    # Gate 2 - the model's own plan still has open items.
+                    tasks = self.context.tasks
+                    if (
+                        task_nudges > 0
+                        and tasks is not None
+                        and getattr(tasks, "open_tasks", [])
+                        and len(tasks) > 1
+                    ):
+                        task_nudges -= 1
+                        self._refuse_finish(
+                            call,
+                            "finish refused: the plan is not finished",
+                            TASKS_HINT.format(tasks=tasks.render()),
+                            f"{len(tasks.open_tasks)} task(s) still open",
+                        )
+                        consecutive_failures = 0
+                        continue
+
+                    # Gate 3 - definition of done: code that was never executed
+                    # is not finished work. Push the model back to its test
+                    # command instead of accepting an optimistic summary.
+                    if require_verification and unverified and nudges_left > 0:
+                        nudges_left -= 1
+                        hint = (
+                            FAILED_VERIFY_HINT.format(
+                                command=last_failed_command, exit_code=last_failed_exit
+                            )
+                            if last_failed_command
+                            else VERIFY_HINT.format(changed=len(set(changed)))
+                        )
+                        self._refuse_finish(
+                            call,
+                            "finish refused: the changes have not been verified yet",
+                            hint,
+                            "Verification required before finishing",
+                        )
+                        consecutive_failures = 0
+                        continue
+
+                    if require_verification and unverified:
+                        summary += (
+                            "\n\n> Warning: Agent3 could not confirm these changes - "
+                            "no verification command succeeded after the last edit."
+                        )
+                    if broken:
+                        summary += (
+                            "\n\n> Warning: these file(s) still contain syntax errors: "
+                            + ", ".join(sorted(broken))
+                        )
+                    live = self._running_processes()
+                    if live:
+                        summary += (
+                            "\n\n> Note: background process(es) still running: "
+                            + ", ".join(live)
+                            + " - use the terminal panel to stop them."
+                        )
+                    result.stop_reason = AgentStopReason.FINISHED
+                    result.final_message = summary
+                    self.callbacks.emit("on_tool_start", call)
+                    self.callbacks.emit("on_tool_result", call, ToolResult(True, output=summary, title="finish"))
+                    break
+
+                signature = call.signature()
+                repeated[signature] = repeated.get(signature, 0) + 1
+
+                self.callbacks.emit("on_status", f"Running tool: {call.name}")
+                self.callbacks.emit("on_tool_start", call)
+                tool_result = self.registry.execute(call, self.context)
+                result.tool_calls += 1
+                self.callbacks.emit("on_tool_result", call, tool_result)
+
+                if tool_result.ok:
+                    consecutive_failures = 0
+                else:
+                    consecutive_failures += 1
+
+                # Track files the auto-checker found broken, and clear the
+                # flag as soon as the same file parses again.
+                syntax = tool_result.data.get("syntax")
+                if isinstance(syntax, dict) and syntax.get("checked"):
+                    syntax_path = str(syntax.get("path") or "")
+                    if syntax_path:
+                        if syntax.get("ok"):
+                            broken.pop(syntax_path, None)
+                        else:
+                            broken[syntax_path] = tool_result.error or tool_result.output
+
+                # Track what still needs proving.
+                if tool_result.ok and call.name in mutating:
+                    touched = str(tool_result.data.get("path") or call.args.get("path") or "")
+                    if touched:
+                        changed.append(touched)
+                    unverified = True
+                    verified_with = ""
+                elif call.name == "run_command":
+                    if tool_result.ok:
+                        unverified = False
+                        verified_with = str(call.args.get("command") or "")
+                        last_failed_command = ""
+                        last_failed_exit = 0
+                    else:
+                        last_failed_command = str(call.args.get("command") or "")
+                        last_failed_exit = int(tool_result.data.get("exit_code") or 1)
+
+                observation = truncate_to_tokens(
+                    tool_result.observation(self.settings.max_output_chars), 6000
+                )
+                follow_up = build_observation(
+                    call.name, observation, iteration=iteration, max_iterations=max_iterations
+                )
+                if not tool_result.ok:
+                    follow_up += f"\n\n{RETRY_HINT}"
+                if repeated[signature] >= 3:
+                    follow_up += f"\n\n{LOOP_HINT}"
+                self.history.append(ChatMessage.user(follow_up))
+            else:
+                result.stop_reason = AgentStopReason.MAX_ITERATIONS
+                result.error = f"stopped after {max_iterations} steps without calling finish"
+
+        except Exception as exc:  # pragma: no cover - safety net
+            trace = log_exception(logger, exc, "agent loop crashed")
+            result.stop_reason = AgentStopReason.ERROR
+            result.error = trace[-2000:]
+            self.callbacks.emit("on_error", str(exc))
+
+        result.duration_ms = int((time.monotonic() - started) * 1000)
+        result.transcript = list(self.history)
+        result.changed_files = sorted(set(changed))
+        result.verified = bool(changed) and not unverified and not broken
+        result.broken_files = sorted(broken)
+        result.verification_command = verified_with
+        if not result.final_message:
+            result.final_message = self._fallback_message(result)
+        self.callbacks.emit("on_status", f"Done ({result.stop_reason.value})")
+        logger.info(
+            "run finished: %s in %d steps / %d tool calls / %d tokens",
+            result.stop_reason.value,
+            result.iterations,
+            result.tool_calls,
+            result.total_tokens,
+        )
+        return result
+
+    def _warn_if_think_ignored(self) -> None:
+        """Tell the user once when the model reasoned despite being muted.
+
+        Some servers drop the ``think`` field before it reaches the chat
+        template, so a model asked for silence keeps emitting a trace. The
+        client still routes it to the reasoning channel, but the user should
+        know their setting is not being honoured end to end.
+        """
+        if self._think_warning_sent:
+            return
+        if not getattr(self.client, "last_think_ignored", False):
+            return
+        self._think_warning_sent = True
+        self.callbacks.emit(
+            "on_status",
+            "This model keeps reasoning even with thinking turned off - the "
+            "trace is being filtered out of its answers.",
+        )
+
+    def _refuse_finish(self, call: ToolCall, reason: str, hint: str, status: str) -> None:
+        """Reject a premature ``finish`` and feed the model a repair hint."""
+        self.callbacks.emit("on_tool_start", call)
+        self.callbacks.emit(
+            "on_tool_result",
+            call,
+            ToolResult(False, error=reason, title="finish (blocked)"),
+        )
+        self.callbacks.emit("on_status", status)
+        self.history.append(ChatMessage.user(hint))
+
+    def _running_processes(self) -> List[str]:
+        """Ids of background processes the agent left running."""
+        manager = self.context.processes
+        if manager is None:
+            return []
+        try:
+            return [info.process_id for info in manager.list(running_only=True)]
+        except Exception:  # pragma: no cover - defensive
+            return []
+
+    @staticmethod
+    def _fallback_message(result: AgentRunResult) -> str:
+        mapping = {
+            AgentStopReason.CANCELLED: "Run cancelled by the user.",
+            AgentStopReason.MAX_ITERATIONS: (
+                "Reached the maximum number of steps before finishing. "
+                "Review the actions above and send a follow-up instruction."
+            ),
+            AgentStopReason.ERROR: f"The run failed: {result.error}",
+        }
+        return mapping.get(result.stop_reason, "")
