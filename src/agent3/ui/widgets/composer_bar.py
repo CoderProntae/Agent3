@@ -116,7 +116,9 @@ class ComposerBar(QFrame):
 
         self.level_box = QComboBox()
         self.level_box.setMinimumWidth(96)
-        self.level_box.setToolTip("Reasoning effort reported by this model")
+        self.level_box.setToolTip(
+            "Reasoning effort. Only values this model really accepts are listed."
+        )
         self.level_box.currentIndexChanged.connect(self._on_level_changed)
         layout.addWidget(self.level_box, 0)
 
@@ -242,33 +244,40 @@ class ComposerBar(QFrame):
                 self._select_level(spec if spec in levels else THINK_AUTO)
             if support.forced:
                 self.think_toggle.setChecked(True)
-            self.level_box.setEnabled(self.think_toggle.isChecked())
+            # The level box stays live even while the switch is off: picking
+            # an effort is how you turn reasoning back on.
+            self.level_box.setEnabled(True)
         finally:
             self._updating = False
 
     def _source_badge(self) -> str:
-        """Tiny caption telling the user where the controls came from.
+        """Caption for the strip - what the control does, not where it came from.
 
-        Discovery is evidence based, so the badge says which evidence was
-        found rather than implying every model of a given name behaves alike.
+        An earlier version printed the discovery source here ("template",
+        "server", "capability"). That is implementation trivia: the user
+        wants to pick an effort level, so the level selector speaks for
+        itself and the provenance moves into the tooltip.
         """
-        support = self._support
-        if support.source == SOURCE_METADATA:
-            return "effort" if support.levels else "server"
-        if support.source == SOURCE_TEMPLATE:
-            return "template"
-        if support.source == SOURCE_CAPABILITY:
-            return "capability"
-        return ""
+        return "effort" if self._support.levels else ""
 
     def _support_tooltip(self) -> str:
+        """Full provenance, for the user who wants to know where this came from."""
         support = self._support
-        lines = [support.describe()]
-        if support.source == SOURCE_TEMPLATE:
-            lines.append(
-                "Read from this model's chat template, which is what actually "
-                "runs for this file."
-            )
+        lines = []
+        if support.levels:
+            lines.append("Reasoning effort: " + ", ".join(support.levels))
+            if isinstance(support.default, str):
+                lines.append(f"Model default: {support.default}")
+        elif support.supported:
+            lines.append("This model reasons on or off, with no effort levels.")
+        lines.append(
+            {
+                SOURCE_METADATA: "Reported by the Ollama server for this model.",
+                SOURCE_TEMPLATE: "Read from this model's own chat template.",
+                SOURCE_CAPABILITY: "The server reports a thinking capability "
+                "but no effort levels.",
+            }.get(support.source, "No reasoning controls were found for this model.")
+        )
         if support.needs_prompt_enforcement:
             lines.append(
                 "Ollama does not forward the think field into this template, "
@@ -305,7 +314,6 @@ class ComposerBar(QFrame):
         self.think_changed.emit(spec)
 
     def _on_toggle(self, checked: bool) -> None:
-        self.level_box.setEnabled(checked)
         if self._updating:
             return
         self._emit_spec()
@@ -351,9 +359,7 @@ class ComposerBar(QFrame):
         """Lock the controls while a run is in flight."""
         self.model_box.setEnabled(not busy)
         self.think_toggle.setEnabled(not busy and self._support.can_disable and self._support.supported)
-        self.level_box.setEnabled(
-            not busy and self._support.supported and self.think_toggle.isChecked()
-        )
+        self.level_box.setEnabled(not busy and self._support.supported)
 
     def available_models(self) -> List[str]:
         return [self.model_box.itemText(i) for i in range(self.model_box.count())]

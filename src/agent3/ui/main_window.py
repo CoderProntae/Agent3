@@ -123,6 +123,9 @@ class MainWindow(QMainWindow):
         self._capability_worker: Optional[ModelCapabilityWorker] = None
         self._active_cards: dict[int, ActionCard] = {}
         self._card_counter = 0
+        #: Reasoning characters swallowed while the trace is hidden,
+        #: surfaced in the status bar so a long silent think is visible.
+        self._hidden_thinking_chars = 0
         self._current_session_id = ""
 
         self.setWindowTitle(f"{APP_NAME} - Autonomous Coding Workspace")
@@ -255,10 +258,12 @@ class MainWindow(QMainWindow):
         self.main_splitter.addWidget(sidebar)
         self.main_splitter.addWidget(center)
         self.main_splitter.addWidget(self.editor)
+        # The conversation is the primary surface, so it gets the largest
+        # share and grows fastest; the editor/diff pane is a companion view.
         self.main_splitter.setStretchFactor(0, 0)
-        self.main_splitter.setStretchFactor(1, 3)
+        self.main_splitter.setStretchFactor(1, 5)
         self.main_splitter.setStretchFactor(2, 3)
-        self.main_splitter.setSizes([300, 640, 740])
+        self.main_splitter.setSizes([280, 830, 570])
 
         # ------------------------------------------------------ terminal
         self.terminal = TerminalPanel()
@@ -634,6 +639,7 @@ class MainWindow(QMainWindow):
         self.loop.model = self.composer_bar.current_model() or self.config.ollama.model
         self.loop.settings = self.config.agent
         self._active_cards.clear()
+        self._hidden_thinking_chars = 0
         self._set_running(True)
 
         worker = AgentWorker(self.loop, text, parent=self)
@@ -681,8 +687,18 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _on_thinking_delta(self, delta: str) -> None:
-        """Stream the reasoning trace into its own collapsible block."""
+        """Stream the reasoning trace into its own collapsible block.
+
+        When the trace is hidden the tokens must not vanish silently: a model
+        can reason for a minute before its first word of answer, and an
+        application that shows nothing for that minute looks frozen. The
+        character counter in the status bar is the proof of life.
+        """
         if not self.config.ollama.show_thinking:
+            self._hidden_thinking_chars += len(delta)
+            self._status_text.setText(
+                f"Reasoning... ({self._hidden_thinking_chars:,} characters so far)"
+            )
             return
         self.chat.append_thinking_delta(delta)
 

@@ -1,30 +1,39 @@
 """System prompt construction for the autonomous coding agent.
 
-Local 7-9B class models need a short, extremely explicit contract.  The prompt
-below is therefore structured as: identity -> hard rules -> tool catalogue ->
-exact output format -> worked example.
+Local 7-9B class models need a short, extremely explicit contract. The prompt
+is therefore structured as: identity -> hard rules -> tool catalogue -> exact
+output format -> worked example.
+
+Prefix stability
+----------------
+The order of the sections is not cosmetic, it is a **performance contract**.
+llama.cpp (and therefore Ollama) reuses the KV cache only for the longest
+common *prefix* of consecutive prompts. Anything volatile placed near the top
+truncates that prefix, and the server then re-processes the whole
+conversation on every single step::
+
+    slot ... | forcing full prompt re-processing due to lack of cache data
+    slot ... | prompt eval time = 22375 ms / 3181 tokens
+
+That is ~20 seconds of dead time per agent step, which looks exactly like a
+hung UI. The workspace tree, the git state and the clock all change between
+steps, so every volatile value lives in :data:`SYSTEM_VOLATILE`, which is
+appended **after** the ~1800 invariant tokens of
+:data:`SYSTEM_STABLE`. The cache then survives from step to step and only the
+newest observation has to be evaluated.
 """
 
 from __future__ import annotations
 
 import platform
 import sys
-from datetime import datetime
+from datetime import date as _date
 from typing import Optional
 
-SYSTEM_TEMPLATE = """You are Agent3, an autonomous senior software engineer working **inside** a local desktop IDE.
+#: Invariant for the whole session: identity, rules, tools, output contract.
+#: Must never contain a value that can change between two steps of one run.
+SYSTEM_STABLE = """You are Agent3, an autonomous senior software engineer working **inside** a local desktop IDE.
 You operate directly on the user's workspace: you read files, write code, run shell commands, run tests and use git.
-
-## Environment
-- Workspace root: {workspace}
-- Operating system: {os_name} ({platform_detail})
-- Shell: {shell}
-- Python: {python_version}
-- Date (local): {date}
-- Git repository: {git_state}
-
-## Project tree (truncated)
-{tree}
 
 ## Hard rules
 1. ACT, do not ask. Never say "I will do X" without immediately emitting the tool call that does X.
@@ -78,6 +87,24 @@ All tests pass, so the work is complete.
 {{"tool": "finish", "args": {{"summary": "Added src/cli.py with a main() entry point; `pytest -q` reports 12 passed."}}}}
 ```
 """
+
+#: Everything that can differ between two steps of the same run. Appended to
+#: the stable block so that it never shortens the reusable KV-cache prefix.
+SYSTEM_VOLATILE = """
+## Environment
+- Workspace root: {workspace}
+- Operating system: {os_name} ({platform_detail})
+- Shell: {shell}
+- Python: {python_version}
+- Date (local): {date}
+- Git repository: {git_state}
+
+## Project tree (truncated)
+{tree}
+"""
+
+#: Kept as a single string for callers that render the whole prompt at once.
+SYSTEM_TEMPLATE = SYSTEM_STABLE + SYSTEM_VOLATILE
 
 PLAN_HINT = """Before your first tool call, think through the task in at most 5 short bullet points:
 what you must change, which files are involved and how you will verify the result."""
@@ -133,6 +160,16 @@ Try a fundamentally different approach: inspect the current state of the files
 (read_file / list_files / run_command) before editing again."""
 
 
+def build_stable_prefix(tools: str) -> str:
+    """Render the part of the prompt that must be byte-identical every step.
+
+    Separated out so the KV-cache contract can be asserted by a test: two
+    renders taken at different times, in different repository states, must
+    share this prefix exactly.
+    """
+    return SYSTEM_STABLE.format(tools=tools)
+
+
 def build_system_prompt(
     *,
     workspace: str,
@@ -141,20 +178,29 @@ def build_system_prompt(
     git_state: str = "not a git repository",
     extra_instructions: str = "",
 ) -> str:
-    """Render the full system prompt for the current workspace."""
-    prompt = SYSTEM_TEMPLATE.format(
+    """Render the full system prompt for the current workspace.
+
+    The invariant block comes first and the workspace snapshot last, so that
+    a step which only changed the file tree still reuses the cached prefix
+    instead of forcing a full prompt re-evaluation.
+    """
+    prompt = build_stable_prefix(tools)
+    # Project instructions belong to the stable half: they come from a file
+    # the user edits between runs, not between steps.
+    if extra_instructions.strip():
+        prompt += f"\n## Additional project instructions\n{extra_instructions.strip()}\n"
+    prompt += SYSTEM_VOLATILE.format(
         workspace=workspace,
         os_name=platform.system(),
         platform_detail=platform.platform(terse=True),
         shell="cmd.exe / PowerShell" if sys.platform.startswith("win") else "sh / bash",
         python_version=platform.python_version(),
-        date=datetime.now().strftime("%Y-%m-%d %H:%M"),
+        # Deliberately the date and not the clock: a timestamp that ticks
+        # every minute would invalidate the cache on its own.
+        date=_date.today().isoformat(),
         git_state=git_state,
         tree=tree or "(empty workspace)",
-        tools=tools,
     )
-    if extra_instructions.strip():
-        prompt += f"\n## Additional project instructions\n{extra_instructions.strip()}\n"
     return prompt
 
 

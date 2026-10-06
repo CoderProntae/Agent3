@@ -90,12 +90,17 @@ Model seçici artık üst çubukta değil, **yazdığınız kutunun hemen altın
 Agent3'te "şu aile şunu destekler" diye bir tablo yoktur. Model değiştiğinde
 `/api/show` sorulur ve şu sırayla gerçek kanıt aranır:
 
-| # | Kaynak | Ne kanıtlar | Rozet |
-|---|---|---|---|
-| 1 | `thinking: {"values": [...], "default": ...}` | Kesin bilgi; sunucu `think` alanını kendisi uygular | `effort` / `server` |
-| 2 | Modelin **chat template**'i | `enable_thinking` → aç/kapa; `reasoning_effort`'ün karşılaştırıldığı tırnaklı liste → **gerçek seviye adları** | `template` |
-| 3 | `capabilities` içinde `"thinking"` | Yalnızca aç/kapa, seviye yok | `capability` |
-| 4 | Hiçbiri | Model akıl yürütmüyor | `no reasoning` |
+| # | Kaynak | Ne kanıtlar |
+|---|---|---|
+| 1 | `thinking: {"values": [...], "default": ...}` | Kesin bilgi; sunucu `think` alanını kendisi uygular |
+| 2 | Modelin **chat template**'i | `enable_thinking` → aç/kapa; `reasoning_effort`'ün karşılaştırıldığı tırnaklı liste → **gerçek seviye adları** |
+| 3 | `capabilities` içinde `"thinking"` | Yalnızca aç/kapa, seviye yok |
+| 4 | Hiçbiri | Model akıl yürütmüyor |
+
+Şeritte **kaynağın adı değil, seçeneğin kendisi** yazar: modelin kabul ettiği
+seviyelerden oluşan bir liste. Liste, anahtar kapalıyken bile tıklanabilir —
+bir seviye seçmek düşünmeyi açar. Bilginin nereden geldiği etiketin değil,
+**üstüne gelince çıkan ipucunun** içindedir.
 
 2. adım, topluluk GGUF paketlerini çalıştıran şeydir. Qwen3.x template'i şunu
 içerir:
@@ -134,6 +139,27 @@ Her ikisi de **Ayarlar → Transport** altından kapatılabilir. Modelin kabul
 etmediği bir değer isteğe hiç konmaz, böylece sunucu isteği tümden reddetmez.
 Akıl yürütme metni yanıttan ayrı bir **"Reasoning"** bloğunda akar; blok
 varsayılan olarak kapalıdır, tıklayarak açarsınız.
+
+### Neden bazen geç yanıt veriyordu?
+
+llama.cpp KV önbelleğini yalnızca iki istemin **ortak ön ekine** uygular. Bu
+yüzden istem düzeni Agent3'te bir performans sözleşmesidir:
+
+* değişmeyen ~2700 token (kimlik, kurallar, araç kataloğu, çıktı biçimi) **en
+  başta**; çalışma alanı fotoğrafı (ağaç, git durumu, tarih) **en sonda**;
+* fotoğraf **tur başına bir kez** üretilir ve adımlar arasında sabit tutulur —
+  dosya oluşturan bir adım artık 0 numaralı mesajı yeniden yazmaz;
+* ortam satırında yalnızca tarih vardır; her dakika değişen bir saat tek
+  başına önbelleği geçersiz kılardı.
+
+Bu düzeltme olmadan sunucu her adımda
+`forcing full prompt re-processing due to lack of cache data` yazıp ilk
+token'dan önce 15-20 saniye harcıyordu — ekrandan bakınca donmuş bir
+uygulamadan farksızdır. Gerçek araç kataloğuyla ölçüldüğünde yeniden
+kullanılabilir ön ek **48 token'dan 2726 token'a** çıktı.
+
+Düşünme izi gizliyken durum çubuğu karakter sayısını yazar; böylece bir dakika
+düşünen bir model asla "takılmış" gibi görünmez.
 
 ### PLAN paneli
 

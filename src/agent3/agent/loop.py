@@ -136,6 +136,8 @@ class AgentLoop:
         #: Guards the "model ignored thinking: off" notice so it is
         #: shown once per loop rather than on every step.
         self._think_warning_sent = False
+        #: Frozen system prompt for the current run (see :meth:`system_prompt`).
+        self._system_prompt: Optional[str] = None
         #: Reasoning spec forwarded to Ollama's ``think`` field. ``None`` means
         #: "use whatever the connection settings say".
         self.think: Optional[str] = None
@@ -165,6 +167,7 @@ class AgentLoop:
         """Forget the conversation (new session)."""
         self.history.clear()
         self._cancel.clear()
+        self.refresh_system_prompt()
 
     def load_history(self, messages: Sequence[ChatMessage]) -> None:
         """Restore a persisted conversation."""
@@ -172,6 +175,31 @@ class AgentLoop:
 
     # -------------------------------------------------------------- prompt
     def system_prompt(self) -> str:
+        """The system prompt for the current run, rendered at most once.
+
+        Re-rendering this between steps used to be the single biggest source
+        of latency. The block contains the workspace tree and the git state,
+        both of which change the moment the agent writes a file, so every
+        step produced a different message 0 - and llama.cpp, which can only
+        reuse the KV cache for a common *prefix*, threw the entire cached
+        conversation away and re-evaluated thousands of tokens::
+
+            forcing full prompt re-processing due to lack of cache data
+            prompt eval time = 22375 ms / 3181 tokens
+
+        Freezing the snapshot for the duration of a run costs nothing in
+        accuracy - the agent already knows what it changed, because it is in
+        the conversation - and turns that 20 s stall into a cache hit.
+        """
+        if self._system_prompt is None:
+            self._system_prompt = self._render_system_prompt()
+        return self._system_prompt
+
+    def refresh_system_prompt(self) -> None:
+        """Drop the frozen snapshot so the next step re-reads the workspace."""
+        self._system_prompt = None
+
+    def _render_system_prompt(self) -> str:
         fs = self.context.fs
         try:
             tree = fs.tree_text(max_depth=3, max_entries=300)
@@ -203,6 +231,9 @@ class AgentLoop:
     def run(self, user_message: str, *, context_hint: str = "") -> AgentRunResult:
         """Execute one autonomous run for *user_message*."""
         self._cancel.clear()
+        # One fresh workspace snapshot per run, then hold it steady so the
+        # server can keep reusing the prompt cache between steps.
+        self.refresh_system_prompt()
         started = time.monotonic()
         result = AgentRunResult(stop_reason=AgentStopReason.ERROR)
         self.usage.begin_run()

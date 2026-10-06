@@ -62,7 +62,19 @@ MARKDOWN_CSS = f"""
 
 
 class _AutoTextBrowser(QTextBrowser):
-    """A QTextBrowser that grows to fit its content (no inner scrollbar)."""
+    """A QTextBrowser that grows to fit its content (no inner scrollbar).
+
+    Measuring the document is only meaningful once it has been laid out at
+    the width it will actually be drawn at. Qt does not do that for us: a
+    fresh ``QTextDocument`` has an unconstrained text width, so asking it for
+    its height before the first resize reports the height of a single very
+    long line. The bubble was then frozen at that height and every table,
+    code block and wrapped paragraph below the first line was clipped away.
+
+    The fix is to pin the document's text width to the viewport and to
+    re-measure on every resize, so the bubble tracks both its content and
+    the width of the panel it lives in.
+    """
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -72,13 +84,30 @@ class _AutoTextBrowser(QTextBrowser):
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.setStyleSheet("background: transparent; border: none;")
         self.setWordWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+        self.document().setDocumentMargin(2)
         self.document().setDefaultStyleSheet(MARKDOWN_CSS)
         self.document().documentLayout().documentSizeChanged.connect(self._fit)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._fit()
+
+    def _available_width(self) -> int:
+        """Width the document may use, excluding frame and scrollbar."""
+        width = self.viewport().width()
+        if width <= 1:
+            width = self.width() - 2 * self.frameWidth()
+        return max(80, width)
 
     def _fit(self) -> None:
-        height = int(self.document().size().height()) + 8
+        document = self.document()
+        width = self._available_width()
+        if abs(document.textWidth() - width) > 0.5:
+            document.setTextWidth(width)
+        height = int(document.size().height()) + 2 * int(document.documentMargin()) + 4
         self.setFixedHeight(max(24, min(height, 20000)))
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        super().resizeEvent(event)
+        self._fit()
 
     def set_markdown(self, text: str) -> None:
         self.setMarkdown(text)

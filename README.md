@@ -138,12 +138,17 @@ A model called `gpt-oss` with no capability reported gets no controls, and an
 obscure community repack gets full effort levels if its template really has
 them. `/api/show` is consulted once per model and read in this order:
 
-| # | Source | What it proves | Badge |
-|---|---|---|---|
-| 1 | `thinking: {"values": [...], "default": ...}` | Authoritative - the server honours the `think` field itself | `effort` / `server` |
-| 2 | The model's **chat template** | `enable_thinking` means on/off; `reasoning_effort` validated against a literal tuple gives the exact level names | `template` |
-| 3 | `capabilities` contains `"thinking"` | On/off only, no levels | `capability` |
-| 4 | Nothing | The model does not reason | `no reasoning` |
+| # | Source | What it proves |
+|---|---|---|
+| 1 | `thinking: {"values": [...], "default": ...}` | Authoritative - the server honours the `think` field itself |
+| 2 | The model's **chat template** | `enable_thinking` means on/off; `reasoning_effort` validated against a literal tuple gives the exact level names |
+| 3 | `capabilities` contains `"thinking"` | On/off only, no levels |
+| 4 | Nothing | The model does not reason |
+
+The strip under the message box shows the **levels**, not the source: a
+dropdown of the values this model accepts, live even while the switch is off
+(picking an effort turns reasoning on). Where the information came from is in
+the tooltip, not in the label.
 
 Step 2 is what makes GGUF repacks work. A Qwen3.x template contains
 
@@ -183,6 +188,29 @@ Both behaviours can be turned off in **Settings → Transport**
 not accept is still dropped before the request is sent, instead of making the
 server reject the whole call, and the trace is always shown in its own
 collapsed block in the transcript.
+
+### Prompt cache and latency
+
+llama.cpp reuses its KV cache only for the longest common **prefix** of two
+consecutive prompts. Agent3 therefore treats prompt layout as a performance
+contract:
+
+* the invariant ~2700 tokens (identity, rules, tool catalogue, output format)
+  come first, and the workspace snapshot - tree, git state, date - goes last;
+* the snapshot is rendered **once per run** and held steady between steps, so
+  a step that created a file does not rewrite message 0;
+* the environment line carries the date only, never a clock that would tick
+  the cache away on its own.
+
+Without this the server logs `forcing full prompt re-processing due to lack
+of cache data` and spends 15-20 s re-evaluating the conversation before the
+first token of every step - which is indistinguishable from a frozen UI.
+Measured on the real tool catalogue, the reusable prefix goes from **48** to
+**2726** tokens.
+
+While a hidden reasoning trace is streaming, the status bar reports the
+character count, so a model that thinks for a minute before answering never
+looks like a hang.
 
 ### Long-running processes
 
