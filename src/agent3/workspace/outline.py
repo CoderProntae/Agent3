@@ -2,7 +2,7 @@
 
 ``read_file`` is the blunt instrument: it spends thousands of context tokens to
 tell the model something it often only needs one line of ("which methods does
-``UsageManager`` have?").  :func:`build_outline` answers that question for a
+``SnapshotStore`` have?").  :func:`build_outline` answers that question for a
 fraction of the cost.
 
 Python is parsed with the real :mod:`ast`, so the result is exact: classes,

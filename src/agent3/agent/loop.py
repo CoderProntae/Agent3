@@ -29,7 +29,6 @@ from agent3.agent.prompts import (
 from agent3.agent.tools import ToolCall, ToolContext, ToolRegistry, ToolResult, parse_tool_calls, strip_tool_calls
 from agent3.core.config import AgentSettings
 from agent3.core.logging_setup import get_logger, log_exception
-from agent3.limits.manager import UsageManager
 from agent3.llm.messages import ChatMessage, Role
 from agent3.llm.ollama_client import OllamaCancelled, OllamaClient, OllamaError
 from agent3.llm.tokenizer import count_message_tokens, truncate_to_tokens
@@ -43,7 +42,6 @@ class AgentStopReason(str, Enum):
     FINISHED = "finished"
     NO_TOOL_CALL = "no_tool_call"
     MAX_ITERATIONS = "max_iterations"
-    QUOTA_BLOCKED = "quota_blocked"
     CANCELLED = "cancelled"
     ERROR = "error"
 
@@ -109,14 +107,13 @@ class AgentRunResult:
 
 
 class AgentLoop:
-    """Drives the model, the tools and the quota engine."""
+    """Drives the model and the tools for one autonomous run."""
 
     def __init__(
         self,
         client: OllamaClient,
         registry: ToolRegistry,
         context: ToolContext,
-        usage: UsageManager,
         settings: Optional[AgentSettings] = None,
         *,
         model: Optional[str] = None,
@@ -126,7 +123,6 @@ class AgentLoop:
         self.client = client
         self.registry = registry
         self.context = context
-        self.usage = usage
         self.settings = settings or AgentSettings()
         self.model = model or client.settings.model
         self.callbacks = callbacks or AgentCallbacks()
@@ -236,7 +232,6 @@ class AgentLoop:
         self.refresh_system_prompt()
         started = time.monotonic()
         result = AgentRunResult(stop_reason=AgentStopReason.ERROR)
-        self.usage.begin_run()
 
         self.history.append(
             ChatMessage.user(build_user_request(user_message, context=context_hint or None))
@@ -269,22 +264,6 @@ class AgentLoop:
                 result.iterations = iteration
 
                 messages = self._window()
-                decision = self.usage.check_request(count_message_tokens(messages))
-                if not decision.allowed:
-                    if decision.code == "cooldown" and decision.retry_after_seconds > 0:
-                        self.callbacks.emit("on_status", f"Rate limited - waiting {decision.retry_after_seconds:.1f}s")
-                        if self._cancel.wait(decision.retry_after_seconds):
-                            result.stop_reason = AgentStopReason.CANCELLED
-                            break
-                        decision = self.usage.check_request(count_message_tokens(messages))
-                    if not decision.allowed:
-                        result.stop_reason = AgentStopReason.QUOTA_BLOCKED
-                        result.error = decision.reason
-                        self.callbacks.emit("on_error", decision.reason)
-                        break
-                if decision.reason:
-                    self.callbacks.emit("on_status", decision.reason)
-
                 self.callbacks.emit("on_status", f"Thinking (step {iteration}/{max_iterations})")
                 try:
                     text, usage = self.client.chat(
@@ -302,7 +281,6 @@ class AgentLoop:
                     break
                 except OllamaError as exc:
                     trace = log_exception(logger, exc, "LLM call failed")
-                    self.usage.record_error(str(exc), where="llm")
                     consecutive_failures += 1
                     self.callbacks.emit("on_error", f"Ollama error: {exc}")
                     if consecutive_failures > max(1, int(self.settings.self_correction_retries)):
@@ -318,13 +296,6 @@ class AgentLoop:
 
                 result.prompt_tokens += usage.prompt_tokens
                 result.completion_tokens += usage.completion_tokens
-                self.usage.record_request(
-                    model=self.model,
-                    prompt_tokens=usage.prompt_tokens,
-                    completion_tokens=usage.completion_tokens,
-                    duration_ms=usage.total_duration_ms,
-                    meta={"iteration": iteration},
-                )
                 self.callbacks.emit(
                     "on_usage",
                     {
@@ -439,27 +410,16 @@ class AgentLoop:
                 signature = call.signature()
                 repeated[signature] = repeated.get(signature, 0) + 1
 
-                quota = self.usage.check_tool_call()
-                if not quota.allowed:
-                    result.stop_reason = AgentStopReason.QUOTA_BLOCKED
-                    result.error = quota.reason
-                    self.callbacks.emit("on_error", quota.reason)
-                    break
-
                 self.callbacks.emit("on_status", f"Running tool: {call.name}")
                 self.callbacks.emit("on_tool_start", call)
                 tool_result = self.registry.execute(call, self.context)
                 result.tool_calls += 1
-                self.usage.record_tool_call(
-                    call.name, duration_ms=tool_result.duration_ms, ok=tool_result.ok
-                )
                 self.callbacks.emit("on_tool_result", call, tool_result)
 
                 if tool_result.ok:
                     consecutive_failures = 0
                 else:
                     consecutive_failures += 1
-                    self.usage.record_error(tool_result.error, where=f"tool:{call.name}")
 
                 # Track files the auto-checker found broken, and clear the
                 # flag as soon as the same file parses again.
@@ -508,7 +468,6 @@ class AgentLoop:
             trace = log_exception(logger, exc, "agent loop crashed")
             result.stop_reason = AgentStopReason.ERROR
             result.error = trace[-2000:]
-            self.usage.record_error(str(exc), where="loop")
             self.callbacks.emit("on_error", str(exc))
 
         result.duration_ms = int((time.monotonic() - started) * 1000)
@@ -573,7 +532,6 @@ class AgentLoop:
     def _fallback_message(result: AgentRunResult) -> str:
         mapping = {
             AgentStopReason.CANCELLED: "Run cancelled by the user.",
-            AgentStopReason.QUOTA_BLOCKED: f"Blocked by usage policy: {result.error}",
             AgentStopReason.MAX_ITERATIONS: (
                 "Reached the maximum number of steps before finishing. "
                 "Review the actions above and send a follow-up instruction."

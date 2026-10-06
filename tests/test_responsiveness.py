@@ -191,6 +191,50 @@ class TestBubbleHeight:
         )
 
 
+#: One very long unwrappable line inside a fenced block - exactly the shape a
+#: tool call takes. Qt's markdown importer marks fenced blocks as
+#: "non breakable", so without a fix the document grows *sideways* instead of
+#: wrapping, and the measured height collapses to a single line.
+WIDE_CODE = (
+    "Calling the tool now:\n\n"
+    "```json\n"
+    '{"tool": "write_file", "args": {"path": "src/agent3/ui/widgets/chat_view.py", '
+    '"content": "a very long single line of generated source code that never ends"}}\n'
+    "```\n"
+)
+
+
+class TestWideCodeBlocksWrap:
+    """A long tool call must wrap and be read, not scroll off the side."""
+
+    def _bubble(self, app, width: int = 600) -> MessageBubble:
+        host = QWidget()
+        host.resize(width, 900)
+        bubble = MessageBubble("assistant", WIDE_CODE, parent=host)
+        bubble.resize(width, bubble.sizeHint().height())
+        host.show()
+        app.processEvents()
+        _KEEP.append(host)
+        return bubble
+
+    def test_the_document_never_grows_wider_than_the_viewport(self, app):
+        body = self._bubble(app)._body  # noqa: SLF001
+        assert body.document().size().width() <= body.document().textWidth() + 1
+
+    def test_a_wrapped_tool_call_is_more_than_one_line(self, app):
+        body = self._bubble(app)._body  # noqa: SLF001
+        line_height = body.fontMetrics().height()
+        assert body.height() > 2 * line_height
+
+    def test_there_is_no_horizontal_scrollbar(self, app):
+        body = self._bubble(app)._body  # noqa: SLF001
+        assert not body.horizontalScrollBar().isVisible()
+
+    def test_the_body_font_is_not_microscopic(self, app):
+        body = self._bubble(app)._body  # noqa: SLF001
+        assert body.font().pointSizeF() >= 10.5
+
+
 class TestComposerShowsEffortNotJargon:
     """The strip offers a level to change, not a word to decode."""
 

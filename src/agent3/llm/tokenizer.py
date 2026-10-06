@@ -1,7 +1,7 @@
 """Model-agnostic token estimation.
 
 Ollama reports authoritative counts (``prompt_eval_count`` /``eval_count``)
-once a request finishes, but the quota engine has to *pre-authorise* a call
+once a request finishes, but the status bar has to show a figure for a call
 before a single byte is sent.  The heuristic below is deliberately simple,
 dependency free and conservative (it slightly over-estimates), which is the
 right bias for a rate limiter.

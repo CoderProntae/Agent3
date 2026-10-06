@@ -3,7 +3,7 @@ name: Build & Release
 # ---------------------------------------------------------------------------
 # Pipeline
 #   1. test          - ubuntu, full pytest suite (headless Qt via offscreen)
-#   2. build-windows - freezes Agent3.exe + UsageLimitEditor.exe (PyInstaller)
+#   2. build-windows - freezes Agent3.exe (PyInstaller)
 #   3. release       - publishes a DRAFT GitHub Release with the zipped build
 #
 # Trigger a build manually from the "Actions" tab (workflow_dispatch) and tick
@@ -103,7 +103,7 @@ jobs:
           git config --global init.defaultBranch main
 
       - name: Run the test suite
-        run: pytest -q --cov=agent3 --cov=usage_limit_editor --cov-report=xml --cov-report=term-missing
+        run: pytest -q --cov=agent3 --cov-report=xml --cov-report=term-missing
 
       - name: Byte-compile every module (syntax gate)
         run: python -m compileall -q src
@@ -143,13 +143,10 @@ jobs:
       - name: Freeze Agent3.exe
         run: python -m PyInstaller packaging/Agent3.spec --noconfirm --clean
 
-      - name: Freeze UsageLimitEditor.exe
-        run: python -m PyInstaller packaging/UsageLimitEditor.spec --noconfirm --clean
-
       - name: Verify the artifacts
         shell: pwsh
         run: |
-          $expected = @("dist/Agent3.exe", "dist/UsageLimitEditor.exe")
+          $expected = @("dist/Agent3.exe")
           foreach ($file in $expected) {
             if (-not (Test-Path $file)) { throw "missing build artifact: $file" }
             $size = (Get-Item $file).Length / 1MB
@@ -203,8 +200,6 @@ jobs:
           # 1. --version must not even need a display.
           Invoke-Exe -Exe "./dist/Agent3.exe" -ExeArgs @("--version") `
                      -DataHome (Join-Path $env:RUNNER_TEMP "smoke-agent-version") | Out-Null
-          Invoke-Exe -Exe "./dist/UsageLimitEditor.exe" -ExeArgs @("--version") `
-                     -DataHome (Join-Path $env:RUNNER_TEMP "smoke-editor-version") | Out-Null
 
           # 2. --self-test builds every widget, every icon and every Qt plugin.
           $log = Invoke-Exe -Exe "./dist/Agent3.exe" -ExeArgs @("--self-test") `
@@ -213,20 +208,13 @@ jobs:
             throw "Agent3.exe did not report a successful self test"
           }
 
-          $log = Invoke-Exe -Exe "./dist/UsageLimitEditor.exe" -ExeArgs @("--self-test") `
-                            -DataHome (Join-Path $env:RUNNER_TEMP "smoke-editor")
-          if (-not (Select-String -Path $log -Pattern "self test OK" -Quiet)) {
-            throw "UsageLimitEditor.exe did not report a successful self test"
-          }
-
-          Write-Host "Both executables start and build their UI correctly."
+          Write-Host "The executable starts and builds its UI correctly."
 
       - name: Stage the release folder
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path release | Out-Null
           Copy-Item dist/Agent3.exe release/
-          Copy-Item dist/UsageLimitEditor.exe release/
           Copy-Item README.md release/
           Copy-Item LICENSE release/
           @"
@@ -235,8 +223,7 @@ jobs:
 
           Contents
           --------
-          Agent3.exe             main desktop application (chat, editor, terminal, git)
-          UsageLimitEditor.exe   administrator tool for daily quotas and token limits
+          Agent3.exe             the desktop application (chat, editor, terminal, git)
 
           Requirements
           ------------
@@ -253,8 +240,8 @@ jobs:
           4. Start Agent3.exe, open File > Settings to pick the model, then
              open a workspace folder with Ctrl+O and describe your task.
 
-          Both executables are portable: configuration, quotas, logs and chat
-          history live in %APPDATA%\Agent3.
+          Agent3.exe is portable: configuration, logs and chat history live
+          in %APPDATA%\Agent3.
           "@ | Out-File -Encoding utf8 release/INSTALL.txt
           Compress-Archive -Path release/* -DestinationPath Agent3-windows-x64.zip -Force
 
@@ -263,14 +250,6 @@ jobs:
         with:
           name: Agent3-windows-exe
           path: dist/Agent3.exe
-          retention-days: 30
-          if-no-files-found: error
-
-      - name: Upload UsageLimitEditor.exe
-        uses: actions/upload-artifact@v7
-        with:
-          name: UsageLimitEditor-windows-exe
-          path: dist/UsageLimitEditor.exe
           retention-days: 30
           if-no-files-found: error
 
@@ -321,9 +300,8 @@ jobs:
             --notes "Automated build from commit ${GITHUB_SHA::8}.
 
           **Downloads**
-          - \`Agent3-windows-x64.zip\` - both executables plus install notes
-          - \`Agent3.exe\` - main desktop application
-          - \`UsageLimitEditor.exe\` - administrator quota tool
+          - \`Agent3-windows-x64.zip\` - the executable plus install notes
+          - \`Agent3.exe\` - the desktop application
 
           Agent3 talks to a local Ollama server on \`http://localhost:11435\`." \
             artifacts/* \

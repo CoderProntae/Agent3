@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Optional
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFont, QTextOption
+from PySide6.QtGui import QColor, QFont, QTextCursor, QTextOption
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -52,6 +52,12 @@ MARKDOWN_CSS = f"""
         padding: 10px;
         font-family: 'Cascadia Code','Consolas',monospace;
         color: #d1d9e6;
+        /* Without this a fenced block is laid out as one endless line: the
+           document grows wider than the bubble, a horizontal scrollbar
+           appears, and the measured document height collapses to a single
+           row - which is why long code and JSON tool calls used to show up
+           as a thin grey strip instead of a message. */
+        white-space: pre-wrap;
     }}
     a {{ color: {COLORS.accent}; }}
     ul, ol {{ margin-left: 18px; }}
@@ -81,10 +87,23 @@ class _AutoTextBrowser(QTextBrowser):
         self.setOpenExternalLinks(True)
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        # Never offer a horizontal scrollbar: the bubble has to wrap instead.
+        # A visible one both steals a row of height and hides content behind
+        # a gesture nobody performs inside a chat transcript.
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setStyleSheet("background: transparent; border: none;")
         self.setWordWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
         self.document().setDocumentMargin(2)
+        # The transcript is the thing people read all day, so it runs a notch
+        # larger than the surrounding chrome instead of inheriting the
+        # compact UI font.
+        body_font = QFont(self.font())
+        body_font.setPointSizeF(max(10.5, body_font.pointSizeF() + 1.5))
+        # Both the widget and the document carry the size: the document font
+        # drives the markdown body, the widget font is what plain-text
+        # fragments and the fontMetrics() of any child fall back to.
+        self.setFont(body_font)
+        self.document().setDefaultFont(body_font)
         self.document().setDefaultStyleSheet(MARKDOWN_CSS)
         self.document().documentLayout().documentSizeChanged.connect(self._fit)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -109,8 +128,40 @@ class _AutoTextBrowser(QTextBrowser):
         super().resizeEvent(event)
         self._fit()
 
+    def _soften_code_blocks(self) -> None:
+        """Let fenced code wrap instead of running off the side of the bubble.
+
+        ``QTextDocument.setMarkdown`` builds the document programmatically, so
+        the default stylesheet is never consulted - a CSS ``white-space``
+        rule has no effect. The importer marks every fenced block
+        ``nonBreakableLines``, which is correct for an editor and disastrous
+        in a fixed-width chat bubble: a single long line (a path, a JSON tool
+        call) makes the document wider than the viewport, the measured height
+        collapses to one row, and the whole message renders as a thin strip.
+
+        Clearing the flag per block is the only way to reach that setting, so
+        we do it right after the import and give code blocks their panel
+        background at the same time.
+        """
+        document = self.document()
+        cursor = QTextCursor(document)
+        cursor.beginEditBlock()
+        block = document.begin()
+        while block.isValid():
+            block_format = block.blockFormat()
+            if block_format.nonBreakableLines():
+                block_format.setNonBreakableLines(False)
+                block_format.setBackground(QColor(COLORS.bg))
+                block_format.setLeftMargin(8)
+                block_format.setRightMargin(8)
+                cursor.setPosition(block.position())
+                cursor.setBlockFormat(block_format)
+            block = block.next()
+        cursor.endEditBlock()
+
     def set_markdown(self, text: str) -> None:
         self.setMarkdown(text)
+        self._soften_code_blocks()
         self._fit()
 
 

@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 from agent3.core.logging_setup import get_logger, log_exception
+from agent3.workspace.command_paths import explain_failure, preflight
 from agent3.workspace.diffing import (
     EditError,
     PatchError,
@@ -475,6 +476,19 @@ def _tool_run_command(ctx: ToolContext, args: Dict[str, Any]) -> ToolResult:
         return ToolResult(False, error="'command' is required")
     timeout = float(_as_int(_arg(args, "timeout", default=ctx.command_timeout), int(ctx.command_timeout)))
     cwd = _arg(args, "cwd", "directory", default=None)
+
+    # Commands that cannot possibly work are rejected before they burn a
+    # shell round-trip - see agent3.workspace.command_paths for why this is
+    # limited to the two cases that are certain.
+    audit = preflight(command, ctx.fs)
+    if audit.blocked:
+        return ToolResult(
+            False,
+            error=audit.message(),
+            output=audit.message(),
+            title=f"run_command {command[:60]}",
+        )
+
     result = ctx.runner.run(
         command,
         cwd=str(cwd) if cwd else None,
@@ -486,6 +500,13 @@ def _tool_run_command(ctx: ToolContext, args: Dict[str, Any]) -> ToolResult:
         # Surface the remediation advice as the error so the loop feeds it
         # straight back to the model instead of a bare "exit 125".
         summary = f"{summary}\n\n{result.error}"
+    elif not result.ok:
+        # A failed command gets its paths checked against the real workspace,
+        # so "No such file or directory" becomes an actionable sentence
+        # instead of an invitation to guess again.
+        explanation = explain_failure(command, ctx.fs)
+        if explanation:
+            summary = f"{summary}\n\n{explanation.message()}"
     return ToolResult(
         ok=result.ok,
         output=summary,
@@ -554,6 +575,11 @@ def _tool_start_process(ctx: ToolContext, args: Dict[str, Any]) -> ToolResult:
     cwd = _arg(args, "cwd", "directory", default=None)
     wait_for = str(_arg(args, "wait_for", "ready_when", default="") or "")
     wait_timeout = float(_as_int(_arg(args, "wait_timeout", "timeout", default=15), 15))
+
+    audit = preflight(command, ctx.fs)
+    if audit.blocked:
+        return ToolResult(False, error=audit.message(), title="start_process")
+
     manager = ctx.process_manager()
     try:
         process = manager.start(

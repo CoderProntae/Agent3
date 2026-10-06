@@ -8,13 +8,13 @@ Layout
     | toolbar: workspace | model | connection | Run / Stop            |
     +------------+--------------------------------+------------------+
     | Explorer   |  Chat + action cards           |  Editor / Diff   |
-    | Sessions   |                                |                  |
-    | Usage      +--------------------------------+                  |
+    | Plan       |                                |                  |
+    | Sessions   +--------------------------------+                  |
     |            |  composer (Ctrl+Enter to send) |                  |
     +------------+--------------------------------+------------------+
     | Terminal console                                               |
     +----------------------------------------------------------------+
-    | status bar: agent state | tokens | quota                       |
+    | status bar: agent state | tokens this run                      |
     +----------------------------------------------------------------+
 """
 
@@ -54,7 +54,6 @@ from agent3.agent.tools import ToolCall, ToolContext, ToolRegistry, ToolResult
 from agent3.core.config import ConfigManager
 from agent3.core.logging_setup import get_logger
 from agent3.core.paths import app_paths, is_frozen
-from agent3.limits.manager import UsageManager
 from agent3.llm.messages import Role
 from agent3.llm.ollama_client import OllamaClient
 from agent3.ui.theme import COLORS, mono_font
@@ -64,7 +63,6 @@ from agent3.ui.widgets.file_tree import WorkspaceTree
 from agent3.ui.widgets.session_list import SessionList
 from agent3.ui.widgets.settings_dialog import SettingsDialog
 from agent3.ui.widgets.terminal_panel import TerminalPanel
-from agent3.ui.widgets.usage_panel import UsagePanel
 from agent3.agent.tasks import TaskList
 from agent3.workspace.processes import ProcessManager
 from agent3.workspace.snapshots import SnapshotStore
@@ -109,7 +107,6 @@ class MainWindow(QMainWindow):
 
         self.client = OllamaClient(self.config.ollama)
         self.registry = ToolRegistry()
-        self.usage = UsageManager()
         self.sessions = SessionStore()
 
         self.fs: Optional[WorkspaceFS] = None
@@ -126,6 +123,8 @@ class MainWindow(QMainWindow):
         #: Reasoning characters swallowed while the trace is hidden,
         #: surfaced in the status bar so a long silent think is visible.
         self._hidden_thinking_chars = 0
+        #: Tokens spent by the run in progress, shown in the status bar.
+        self._run_tokens = 0
         self._current_session_id = ""
 
         self.setWindowTitle(f"{APP_NAME} - Autonomous Coding Workspace")
@@ -135,11 +134,6 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._build_actions()
         self._restore_window_state()
-
-        self._usage_timer = QTimer(self)
-        self._usage_timer.setInterval(2500)
-        self._usage_timer.timeout.connect(self.refresh_usage)
-        self._usage_timer.start()
 
         QTimer.singleShot(60, self._bootstrap)
 
@@ -173,9 +167,6 @@ class MainWindow(QMainWindow):
         self.session_list.session_deleted.connect(self._delete_session)
         self.session_list.session_renamed.connect(self._rename_session)
 
-        self.usage_panel = UsagePanel()
-        self.usage_panel.editor_button.clicked.connect(self.open_usage_editor)
-
         #: Live view of the plan the agent maintains with `manage_tasks`.
         self.task_panel = TaskPanel()
 
@@ -192,27 +183,10 @@ class MainWindow(QMainWindow):
         sidebar.addWidget(explorer_box)
         sidebar.addWidget(self.task_panel)
         sidebar.addWidget(self.session_list)
-        sidebar.addWidget(self.usage_panel)
-        sidebar.setSizes([330, 250, 170, 290])
+        sidebar.setSizes([420, 280, 280])
         sidebar.setMinimumWidth(240)
 
         # ---------------------------------------------------------- chat
-        self.quota_banner = QFrame()
-        self.quota_banner.setVisible(False)
-        self.quota_banner.setStyleSheet(
-            f"background-color: #2a2113; border: 1px solid {COLORS.warning}; border-radius: 6px;"
-        )
-        banner_layout = QHBoxLayout(self.quota_banner)
-        banner_layout.setContentsMargins(12, 7, 12, 7)
-        self._banner_label = QLabel("")
-        self._banner_label.setWordWrap(True)
-        self._banner_label.setStyleSheet(f"color: {COLORS.warning};")
-        banner_layout.addWidget(self._banner_label, 1)
-        banner_button = QPushButton("Manage limits")
-        banner_button.setObjectName("Ghost")
-        banner_button.clicked.connect(self.open_usage_editor)
-        banner_layout.addWidget(banner_button, 0)
-
         self.chat = ChatView()
 
         self.composer = Composer(self.send_message)
@@ -245,7 +219,6 @@ class MainWindow(QMainWindow):
         center_layout = QVBoxLayout(center)
         center_layout.setContentsMargins(8, 8, 8, 8)
         center_layout.setSpacing(8)
-        center_layout.addWidget(self.quota_banner)
         center_layout.addWidget(self.chat, 1)
         center_layout.addWidget(self.composer, 0)
         center_layout.addWidget(self.composer_bar, 0)
@@ -281,10 +254,9 @@ class MainWindow(QMainWindow):
         self.setStatusBar(status)
         self._status_text = QLabel("Ready")
         self._status_tokens = QLabel("tokens: 0")
-        self._status_quota = QLabel("quota: -")
         for widget in (self._status_text,):
             status.addWidget(widget, 1)
-        for widget in (self._status_tokens, self._status_quota):
+        for widget in (self._status_tokens,):
             widget.setStyleSheet(f"color: {COLORS.text_faint}; padding: 0 10px;")
             status.addPermanentWidget(widget, 0)
 
@@ -361,10 +333,6 @@ class MainWindow(QMainWindow):
         view_menu.addAction(self._toggle_editor_action)
 
         tools_menu = self.menuBar().addMenu("&Tools")
-        usage_action = QAction("Usage Limit Editor", self)
-        usage_action.triggered.connect(self.open_usage_editor)
-        tools_menu.addAction(usage_action)
-
         logs_action = QAction("Open log folder", self)
         logs_action.triggered.connect(self._open_logs)
         tools_menu.addAction(logs_action)
@@ -388,7 +356,6 @@ class MainWindow(QMainWindow):
         if not self._current_session_id:
             self.new_session(silent=True)
         self.check_connection()
-        self.refresh_usage()
 
     def check_connection(self) -> None:
         """Ping Ollama in the background and update the toolbar badge."""
@@ -513,7 +480,6 @@ class MainWindow(QMainWindow):
             self.client,
             self.registry,
             self.tool_context,
-            self.usage,
             self.config.agent,
             model=self.composer_bar.current_model() or self.config.ollama.model,
         )
@@ -548,21 +514,20 @@ class MainWindow(QMainWindow):
             model=self.composer_bar.current_model(),
         )
         self._current_session_id = session.id
-        self.usage.start_session(session.id)
         if self.loop is not None:
             self.loop.reset()
         self.chat.clear()
         self._refresh_sessions()
         if not silent:
-            self.chat.add_notice("New session started - token budget reset.", "system")
-        self.refresh_usage()
+            self.chat.add_notice("New session started.", "system")
+        self._run_tokens = 0
+        self._status_tokens.setText("tokens: 0")
 
     def load_session(self, session_id: str) -> None:
         session = self.sessions.get(session_id)
         if session is None:
             return
         self._current_session_id = session_id
-        self.usage.start_session(session_id)
         self.chat.clear()
         messages = self.sessions.messages(session_id)
         for message in messages:
@@ -577,7 +542,6 @@ class MainWindow(QMainWindow):
         if self.loop is not None:
             self.loop.load_history(messages)
         self._refresh_sessions()
-        self.refresh_usage()
 
     def _delete_session(self, session_id: str) -> None:
         self.sessions.delete(session_id)
@@ -621,12 +585,6 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Agent busy", "The agent is already running.")
             return
 
-        decision = self.usage.check_request(0)
-        if not decision.allowed and decision.code != "cooldown":
-            self._show_banner(decision.reason, blocking=True)
-            QMessageBox.warning(self, "Usage limit reached", decision.reason)
-            return
-
         self.composer.clear()
         self.chat.add_message("user", text)
         if self._current_session_id:
@@ -640,6 +598,7 @@ class MainWindow(QMainWindow):
         self.loop.settings = self.config.agent
         self._active_cards.clear()
         self._hidden_thinking_chars = 0
+        self._run_tokens = 0
         self._set_running(True)
 
         worker = AgentWorker(self.loop, text, parent=self)
@@ -776,8 +735,9 @@ class MainWindow(QMainWindow):
 
     @Slot(dict)
     def _on_usage_updated(self, payload: dict) -> None:
-        self._status_tokens.setText(f"tokens: {payload.get('total_tokens', 0):,}")
-        self.refresh_usage()
+        """Show how many tokens the current run has cost so far."""
+        self._run_tokens += int(payload.get("total_tokens", 0))
+        self._status_tokens.setText(f"tokens: {self._run_tokens:,}")
 
     @Slot(str)
     def _on_error(self, message: str) -> None:
@@ -789,7 +749,6 @@ class MainWindow(QMainWindow):
         self._set_running(False)
         self.chat.end_assistant_stream()
         self.tree.refresh()
-        self.refresh_usage()
         if result is None:
             return
         if result.final_message:
@@ -823,69 +782,6 @@ class MainWindow(QMainWindow):
             if key in args:
                 return f"{key}: {str(args[key])[:160]}"
         return ""
-
-    # =============================================================== usage
-    def refresh_usage(self) -> None:
-        """Pull a fresh snapshot and update the sidebar / banner / status."""
-        try:
-            snapshot = self.usage.snapshot()
-        except Exception as exc:  # pragma: no cover - telemetry must never crash the UI
-            logger.debug("usage snapshot failed: %s", exc)
-            return
-        self.usage_panel.update_snapshot(snapshot)
-        day = snapshot.day_totals
-        self._status_tokens.setText(f"tokens today: {day.total_tokens:,}")
-        policy = snapshot.policy
-        if policy.max_requests_per_day:
-            self._status_quota.setText(
-                f"requests: {day.requests}/{policy.max_requests_per_day}"
-            )
-        else:
-            self._status_quota.setText(f"requests: {day.requests}")
-
-        if snapshot.blocked:
-            self._show_banner(snapshot.block_reason, blocking=True)
-        elif snapshot.warning:
-            self._show_banner(snapshot.warning, blocking=False)
-        else:
-            self.quota_banner.setVisible(False)
-
-    def _show_banner(self, text: str, *, blocking: bool) -> None:
-        color = COLORS.danger if blocking else COLORS.warning
-        background = "#2a1517" if blocking else "#2a2113"
-        self.quota_banner.setStyleSheet(
-            f"background-color: {background}; border: 1px solid {color}; border-radius: 6px;"
-        )
-        self._banner_label.setStyleSheet(f"color: {color};")
-        self._banner_label.setText(text)
-        self.quota_banner.setVisible(bool(text))
-        self._run_button.setEnabled(not blocking and not (self.worker and self.worker.isRunning()))
-
-    def open_usage_editor(self) -> None:
-        """Launch ``UsageLimitEditor`` as a separate process."""
-        try:
-            if is_frozen():
-                candidates = [
-                    Path(sys.executable).parent / "UsageLimitEditor.exe",
-                    Path(sys.executable).parent / "UsageLimitEditor",
-                ]
-                for candidate in candidates:
-                    if candidate.exists():
-                        subprocess.Popen([str(candidate)])
-                        return
-                QMessageBox.warning(
-                    self,
-                    "Usage Limit Editor",
-                    "UsageLimitEditor executable was not found next to Agent3.",
-                )
-                return
-            subprocess.Popen(
-                [sys.executable, "-m", "usage_limit_editor"],
-                cwd=str(Path(__file__).resolve().parents[3]),
-                env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[2])},
-            )
-        except OSError as exc:
-            QMessageBox.critical(self, "Usage Limit Editor", str(exc))
 
     # ================================================================= git
     def _require_git(self) -> bool:
@@ -1032,8 +928,6 @@ class MainWindow(QMainWindow):
         except Exception:  # pragma: no cover
             logger.debug("could not persist window state", exc_info=True)
 
-        self._usage_timer.stop()
         self.client.close()
-        self.usage.close()
         self.sessions.close()
         event.accept()

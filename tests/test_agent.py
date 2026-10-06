@@ -207,19 +207,18 @@ class TestToolExecution:
 
 # ----------------------------------------------------------------------- loop
 class TestAgentLoop:
-    def build(self, responses, usage_manager, tool_context, **settings):
+    def build(self, responses, tool_context, **settings):
         client = FakeClient(responses)
         loop = AgentLoop(
             client,
             ToolRegistry(),
             tool_context,
-            usage_manager,
             AgentSettings(max_iterations=settings.pop("max_iterations", 8), **settings),
             model="fake-model",
         )
         return client, loop
 
-    def test_single_write_then_finish(self, usage_manager, tool_context):
+    def test_single_write_then_finish(self, tool_context):
         """A write followed by a successful check is a complete run."""
         _client, loop = self.build(
             [
@@ -227,7 +226,6 @@ class TestAgentLoop:
                 tool_block("run_command", command="python -c \"print(1)\""),
                 tool_block("finish", summary="Created out.py"),
             ],
-            usage_manager,
             tool_context,
         )
         result = loop.run("create out.py")
@@ -238,7 +236,7 @@ class TestAgentLoop:
         assert result.changed_files == ["out.py"]
         assert tool_context.fs.read_text("out.py") == "print('x')\n"
 
-    def test_write_without_verification_is_pushed_back(self, usage_manager, tool_context):
+    def test_write_without_verification_is_pushed_back(self, tool_context):
         """`finish` straight after an edit is refused once, with guidance."""
         client, loop = self.build(
             [
@@ -247,7 +245,6 @@ class TestAgentLoop:
                 tool_block("run_command", command="python -c \"print(1)\""),
                 tool_block("finish", summary="Created out.py and verified it"),
             ],
-            usage_manager,
             tool_context,
         )
         result = loop.run("create out.py")
@@ -265,7 +262,7 @@ class TestAgentLoop:
         assert result.verification_command.startswith("python -c")
         assert result.final_message == "Created out.py and verified it"
 
-    def test_verification_nudge_happens_only_once(self, usage_manager, tool_context):
+    def test_verification_nudge_happens_only_once(self, tool_context):
         """A stubborn model is not deadlocked - it finishes with a warning."""
         _client, loop = self.build(
             [
@@ -273,7 +270,6 @@ class TestAgentLoop:
                 tool_block("finish", summary="done"),
                 tool_block("finish", summary="done"),
             ],
-            usage_manager,
             tool_context,
         )
         result = loop.run("create out.py")
@@ -281,7 +277,7 @@ class TestAgentLoop:
         assert result.verified is False
         assert "could not confirm these changes" in result.final_message
 
-    def test_failed_command_blocks_finish_with_its_own_hint(self, usage_manager, tool_context):
+    def test_failed_command_blocks_finish_with_its_own_hint(self, tool_context):
         """A red test run is not 'done' - the model is told to fix it."""
         client, loop = self.build(
             [
@@ -291,7 +287,6 @@ class TestAgentLoop:
                 tool_block("run_command", command="python -c \"print(1)\""),
                 tool_block("finish", summary="fixed and verified"),
             ],
-            usage_manager,
             tool_context,
         )
         result = loop.run("create out.py")
@@ -305,14 +300,13 @@ class TestAgentLoop:
         assert "exited with 3" in hints[0]
         assert result.verified is True
 
-    def test_read_only_run_can_finish_without_verification(self, usage_manager, tool_context):
+    def test_read_only_run_can_finish_without_verification(self, tool_context):
         """Nothing was changed, so there is nothing to verify."""
         _client, loop = self.build(
             [
                 tool_block("list_files", path="."),
                 tool_block("finish", summary="The project has 3 files."),
             ],
-            usage_manager,
             tool_context,
         )
         result = loop.run("what is here?")
@@ -320,13 +314,12 @@ class TestAgentLoop:
         assert result.final_message == "The project has 3 files."
         assert result.changed_files == []
 
-    def test_verification_gate_can_be_disabled(self, usage_manager, tool_context):
+    def test_verification_gate_can_be_disabled(self, tool_context):
         _client, loop = self.build(
             [
                 tool_block("write_file", path="out.py", content="print('x')\n"),
                 tool_block("finish", summary="done"),
             ],
-            usage_manager,
             tool_context,
             require_verification=False,
         )
@@ -334,20 +327,19 @@ class TestAgentLoop:
         assert result.stop_reason is AgentStopReason.FINISHED
         assert result.final_message == "done"
 
-    def test_usage_is_recorded(self, usage_manager, tool_context):
-        _client, loop = self.build([tool_block("finish", summary="ok")], usage_manager, tool_context)
+    def test_token_counters_are_accumulated(self, tool_context):
+        """Token statistics survived the removal of the quota engine."""
+        _client, loop = self.build([tool_block("finish", summary="ok")], tool_context)
         result = loop.run("hello")
         assert result.prompt_tokens == 10 and result.completion_tokens == 5
-        assert usage_manager.store.totals_for_day().requests == 1
 
-    def test_self_correction_after_tool_error(self, usage_manager, tool_context):
+    def test_self_correction_after_tool_error(self, tool_context):
         _client, loop = self.build(
             [
                 tool_block("read_file", path="missing.py"),
                 tool_block("write_file", path="missing.py", content="ok\n"),
                 tool_block("finish", summary="recovered"),
             ],
-            usage_manager,
             tool_context,
         )
         result = loop.run("read the file")
@@ -355,66 +347,41 @@ class TestAgentLoop:
         assert result.tool_calls == 2
         assert tool_context.fs.exists("missing.py")
 
-    def test_retry_hint_is_injected(self, usage_manager, tool_context):
+    def test_retry_hint_is_injected(self, tool_context):
         client, loop = self.build(
             [tool_block("read_file", path="missing.py"), tool_block("finish", summary="done")],
-            usage_manager,
             tool_context,
         )
         loop.run("go")
         second_prompt = client.calls[1][-1].content
         assert "ERROR" in second_prompt and "corrected tool call" in second_prompt
 
-    def test_max_iterations_guard(self, usage_manager, tool_context):
+    def test_max_iterations_guard(self, tool_context):
         responses = [tool_block("list_files", path=".") for _ in range(20)]
-        _client, loop = self.build(responses, usage_manager, tool_context, max_iterations=3)
+        _client, loop = self.build(responses, tool_context, max_iterations=3)
         result = loop.run("loop forever")
         assert result.stop_reason is AgentStopReason.MAX_ITERATIONS
         assert result.iterations == 3
 
-    def test_loop_hint_after_repeats(self, usage_manager, tool_context):
+    def test_loop_hint_after_repeats(self, tool_context):
         responses = [tool_block("list_files", path=".") for _ in range(6)]
-        client, loop = self.build(responses, usage_manager, tool_context, max_iterations=5)
+        client, loop = self.build(responses, tool_context, max_iterations=5)
         loop.run("repeat")
         assert any("fundamentally different approach" in m.content for m in client.calls[-1])
 
-    def test_plain_answer_terminates(self, usage_manager, tool_context):
+    def test_plain_answer_terminates(self, tool_context):
         _client, loop = self.build(
             [tool_block("list_files"), "The project only contains a README."],
-            usage_manager,
             tool_context,
         )
         result = loop.run("what is in here?")
         assert result.stop_reason is AgentStopReason.NO_TOOL_CALL
         assert "README" in result.final_message
 
-    def test_quota_block_stops_the_run(self, usage_manager, tool_context):
-        policy = usage_manager.policies.load()
-        policy.max_requests_per_day = 1
-        usage_manager.policies.save(policy)
-        usage_manager.record_request(model="m", prompt_tokens=1, completion_tokens=1, duration_ms=1)
-        _client, loop = self.build([tool_block("finish", summary="x")], usage_manager, tool_context)
-        result = loop.run("do something")
-        assert result.stop_reason is AgentStopReason.QUOTA_BLOCKED
-        assert "Daily request limit" in result.error
-
-    def test_tool_call_quota_stops_the_run(self, usage_manager, tool_context):
-        policy = usage_manager.policies.load()
-        policy.max_tool_calls_per_run = 1
-        usage_manager.policies.save(policy)
-        _client, loop = self.build(
-            [tool_block("list_files"), tool_block("list_files"), tool_block("finish", summary="x")],
-            usage_manager,
-            tool_context,
-        )
-        result = loop.run("go")
-        assert result.stop_reason is AgentStopReason.QUOTA_BLOCKED
-
-    def test_callbacks_fire(self, usage_manager, tool_context):
+    def test_callbacks_fire(self, tool_context):
         events = {"status": 0, "tools": [], "messages": []}
         _client, loop = self.build(
             [tool_block("write_file", path="a.txt", content="a"), tool_block("finish", summary="ok")],
-            usage_manager,
             tool_context,
             require_verification=False,
         )
@@ -428,16 +395,16 @@ class TestAgentLoop:
         assert events["tools"] == ["write_file", "finish"]
         assert events["messages"]
 
-    def test_cancellation(self, usage_manager, tool_context):
-        _client, loop = self.build([tool_block("list_files")] * 5, usage_manager, tool_context)
+    def test_cancellation(self, tool_context):
+        _client, loop = self.build([tool_block("list_files")] * 5, tool_context)
         # Simulate the user pressing "Stop" while the first tool is running.
         loop.callbacks = AgentCallbacks(on_tool_start=lambda _call: loop.cancel())
         result = loop.run("go")
         assert result.stop_reason is AgentStopReason.CANCELLED
         assert result.tool_calls == 1
 
-    def test_system_prompt_contains_workspace_and_tools(self, usage_manager, tool_context):
-        _client, loop = self.build([], usage_manager, tool_context)
+    def test_system_prompt_contains_workspace_and_tools(self, tool_context):
+        _client, loop = self.build([], tool_context)
         prompt = loop.system_prompt()
         assert str(tool_context.fs.root) in prompt
         assert "write_file" in prompt and "finish" in prompt
@@ -490,20 +457,19 @@ class TestSessionStore:
 class TestRuntimeGates:
     """The loop refuses to finish on broken code or an unfinished plan."""
 
-    def build(self, responses, usage_manager, tool_context, **settings):
+    def build(self, responses, tool_context, **settings):
         client = FakeClient(responses)
         loop = AgentLoop(
             client,
             ToolRegistry(),
             tool_context,
-            usage_manager,
             AgentSettings(max_iterations=settings.pop("max_iterations", 10), **settings),
             model="fake-model",
         )
         return client, loop
 
     # ----------------------------------------------------------- syntax
-    def test_finish_is_refused_while_a_file_is_broken(self, usage_manager, tool_context):
+    def test_finish_is_refused_while_a_file_is_broken(self, tool_context):
         _client, loop = self.build(
             [
                 tool_block("write_file", path="broken.py", content="def f(:\n"),
@@ -512,7 +478,6 @@ class TestRuntimeGates:
                 tool_block("run_command", command="python -c \"print(1)\""),
                 tool_block("finish", summary="Fixed and verified"),
             ],
-            usage_manager,
             tool_context,
         )
         result = loop.run("write broken.py")
@@ -521,7 +486,7 @@ class TestRuntimeGates:
         assert result.broken_files == []
         assert any("SYNTAX" in m.content for m in loop.history if m.role is Role.USER)
 
-    def test_broken_file_is_reported_when_the_model_insists(self, usage_manager, tool_context):
+    def test_broken_file_is_reported_when_the_model_insists(self, tool_context):
         _client, loop = self.build(
             [
                 tool_block("write_file", path="broken.py", content="def f(:\n"),
@@ -530,7 +495,6 @@ class TestRuntimeGates:
                 tool_block("finish", summary="Done"),
                 tool_block("finish", summary="Done"),
             ],
-            usage_manager,
             tool_context,
             require_verification=False,
         )
@@ -540,13 +504,12 @@ class TestRuntimeGates:
         assert "syntax errors" in result.final_message
         assert result.verified is False
 
-    def test_a_clean_write_passes_the_syntax_gate(self, usage_manager, tool_context):
+    def test_a_clean_write_passes_the_syntax_gate(self, tool_context):
         _client, loop = self.build(
             [
                 tool_block("write_file", path="fine.py", content="x = 1\n"),
                 tool_block("finish", summary="Done"),
             ],
-            usage_manager,
             tool_context,
             require_verification=False,
         )
@@ -555,7 +518,7 @@ class TestRuntimeGates:
         assert result.broken_files == []
 
     # ------------------------------------------------------------ tasks
-    def test_finish_is_refused_while_tasks_are_open(self, usage_manager, tool_context):
+    def test_finish_is_refused_while_tasks_are_open(self, tool_context):
         _client, loop = self.build(
             [
                 tool_block(
@@ -574,7 +537,6 @@ class TestRuntimeGates:
                 ),
                 tool_block("finish", summary="All done for real"),
             ],
-            usage_manager,
             tool_context,
             require_verification=False,
         )
@@ -584,35 +546,32 @@ class TestRuntimeGates:
         assert any("plan still has open items" in m.content for m in loop.history
                    if m.role is Role.USER)
 
-    def test_a_single_task_does_not_block_finishing(self, usage_manager, tool_context):
+    def test_a_single_task_does_not_block_finishing(self, tool_context):
         _client, loop = self.build(
             [
                 tool_block("manage_tasks", action="add", tasks=[{"id": "a", "description": "A"}]),
                 tool_block("finish", summary="Done"),
             ],
-            usage_manager,
             tool_context,
             require_verification=False,
         )
         assert loop.run("one thing").final_message == "Done"
 
-    def test_no_plan_means_no_gate(self, usage_manager, tool_context):
+    def test_no_plan_means_no_gate(self, tool_context):
         _client, loop = self.build(
             [tool_block("finish", summary="Nothing to do")],
-            usage_manager,
             tool_context,
             require_verification=False,
         )
         assert loop.run("hello").final_message == "Nothing to do"
 
-    def test_task_changes_reach_the_callback(self, usage_manager, tool_context):
+    def test_task_changes_reach_the_callback(self, tool_context):
         seen = []
         _client, loop = self.build(
             [
                 tool_block("manage_tasks", action="add", tasks=["step one"]),
                 tool_block("finish", summary="Done"),
             ],
-            usage_manager,
             tool_context,
             require_verification=False,
         )
@@ -622,21 +581,20 @@ class TestRuntimeGates:
         assert len(seen) == 1
 
     # ---------------------------------------------------------- thinking
-    def test_think_spec_is_forwarded_to_the_client(self, usage_manager, tool_context):
+    def test_think_spec_is_forwarded_to_the_client(self, tool_context):
         client, loop = self.build(
-            [tool_block("finish", summary="ok")], usage_manager, tool_context
+            [tool_block("finish", summary="ok")], tool_context
         )
         loop.think = "high"
         loop.run("hi")
         assert client.think_values == ["high"]
 
-    def test_reasoning_is_streamed_and_kept_off_the_answer(self, usage_manager, tool_context):
+    def test_reasoning_is_streamed_and_kept_off_the_answer(self, tool_context):
         client = FakeClient([tool_block("finish", summary="ok")], thinking="let me think")
         loop = AgentLoop(
             client,
             ToolRegistry(),
             tool_context,
-            usage_manager,
             AgentSettings(max_iterations=4),
             model="fake-model",
         )
@@ -649,7 +607,7 @@ class TestRuntimeGates:
 
     # --------------------------------------------------------- processes
     def test_background_processes_are_flagged_in_the_summary(
-        self, usage_manager, tool_context
+        self, tool_context
     ):
         class _FakeInfo:
             process_id = "proc-1"
@@ -661,7 +619,6 @@ class TestRuntimeGates:
         tool_context.processes = _FakeManager()
         _client, loop = self.build(
             [tool_block("finish", summary="Done")],
-            usage_manager,
             tool_context,
             require_verification=False,
         )

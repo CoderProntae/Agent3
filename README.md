@@ -4,7 +4,7 @@
 
 **A local, autonomous AI coding agent and workspace — as a native desktop application.**
 
-Chat · File explorer · Code editor with live diffs · Embedded terminal · Git · Enterprise usage quotas
+Chat · File explorer · Code editor with live diffs · Embedded terminal · Git · Background processes
 Powered entirely by a **local Ollama** server on `http://localhost:11435`. No cloud, no telemetry.
 
 </div>
@@ -15,15 +15,10 @@ Powered entirely by a **local Ollama** server on `http://localhost:11435`. No cl
 
 Agent3 is a desktop IDE-shell (PySide6 / Qt 6) in which an autonomous agent works **inside a folder you
 choose**. It reads your files, writes code, runs shell commands, executes your tests, inspects the
-failure output, fixes itself, and commits with git — while an administrator-controlled quota engine
-tracks every token, request and second of runtime.
+failure output, fixes itself, and commits with git.
 
-Two executables are produced by CI:
-
-| Executable | Purpose |
-|---|---|
-| `Agent3.exe` | The main workspace application |
-| `UsageLimitEditor.exe` | Standalone administrator tool for quotas, token limits and developer-mode override |
+CI produces a single portable executable, `Agent3.exe`: no installer, no runtime to deploy, and all
+of its state in `%APPDATA%\Agent3`.
 
 ---
 
@@ -59,8 +54,8 @@ python -m venv .venv && . .venv/bin/activate      # Windows: .venv\Scripts\activ
 pip install -r requirements-dev.txt
 
 python -m agent3                 # main application
-python -m usage_limit_editor     # administrator tool
-pytest -q                        # 160+ tests
+python -m agent3 --self-test     # verify the install without a model
+pytest -q                        # 530+ tests
 ```
 
 ---
@@ -73,11 +68,9 @@ src/
 │   ├── app.py                  bootstrap: CLI flags, logging, theme, main window
 │   ├── core/                   paths · rotating logs · AES-GCM secure store · typed config
 │   ├── llm/                    Ollama REST client (streaming, retries) · token estimator
-│   ├── limits/                 quota policy · SQLite telemetry · rate-limiting engine
 │   ├── workspace/              sandboxed fs · diffing · shell runner · git wrapper
 │   ├── agent/                  tool registry · prompt contract · autonomous loop · sessions
 │   └── ui/                     dark theme · syntax highlighting · widgets · QThread workers
-└── usage_limit_editor/         standalone administrator GUI
 ```
 
 Every layer below `ui/` is pure Python and unit-tested without a Qt event loop or a live model.
@@ -88,7 +81,7 @@ Every layer below `ui/` is pure Python and unit-tested without a Qt event loop o
 user instruction
       │
       ▼
- build system prompt  ──►  quota pre-authorisation  ──►  Ollama /api/chat (streamed)
+ build system prompt  ──────────────────────────────►  Ollama /api/chat (streamed)
       ▲                                                        │
       │                                              parse the JSON tool call
    observation                                                 │
@@ -300,34 +293,26 @@ Set `agent.require_verification = false` in `config.json` to opt out.
 * `CommandRunner` refuses `rm -rf /`, `mkfs`, `format C:`, fork bombs, `curl … | sh`, and friends
   (the pattern list is user-editable in the config), confines the working directory to the workspace,
   enforces timeouts and kills the whole process group on stop.
-* Secrets (the GitHub token) and the quota policy are stored **AES-256-GCM encrypted** with a
-  PBKDF2-derived key; tampering with the file makes decryption fail and Agent3 falls back to the
-  *conservative* default quotas rather than unlimited access.
+* Secrets (the GitHub token) are stored **AES-256-GCM encrypted** with a PBKDF2-derived key;
+  tampering with the file makes decryption fail loudly instead of silently returning a default.
 
 ---
 
-## Enterprise quotas
+## Path and shell awareness
 
-The quota engine (`agent3/limits/`) gates every LLM request and every tool call:
+Small local models fail at the shell in a narrow, repetitive way: an unquoted folder name with a
+space, an invented directory level, `mv` on Windows, `cd x & y` that keeps going after the `cd`
+already failed. `agent3/workspace/command_paths.py` turns each of those into a sentence the model
+can act on:
 
-| Limit | Default | Meaning |
-|---|---|---|
-| `max_requests_per_day` | 500 | Daily LLM requests |
-| `max_tokens_per_day` | 1,000,000 | Daily prompt + completion tokens |
-| `max_tokens_per_session` | 100,000 | Per chat session (reset with *New session*) |
-| `max_tokens_per_request` | 32,000 | Rejects an oversized prompt before it is sent |
-| `max_runtime_seconds_per_day` | 14,400 | Active model runtime |
-| `max_agent_runs_per_day` | 100 | Autonomous runs |
-| `max_tool_calls_per_run` | 60 | Runaway-loop guard |
-| `min_seconds_between_requests` | 0 | Cooldown / rate limit |
+| Situation | What happens |
+|---|---|
+| `mv`, `cp`, `rm`, `ls`, `cat`, `touch`, `grep`, `sed` on Windows | Refused **before execution**, with the tool that replaces it (`rename_file`, `delete_file`, …) |
+| `cd into-a-missing-folder & …` | Refused before execution; the real folder is named and the `cwd` argument is shown as JSON |
+| A command fails and mentions a path that is not there | The closest real workspace path is appended to the error — plus a quoting reminder when it contains a space |
 
-`0` always means *unlimited*. The sidebar shows live gauges (green → amber at 80 % → red), a banner
-appears when a limit is hit, and the agent refuses to start.
-
-**`UsageLimitEditor.exe`** edits the encrypted policy, can set an administrator password (PBKDF2,
-constant-time verification), toggles *developer mode* (bypass everything), shows a 21-day consumption
-table and can reset today's counters or the whole history. The main app re-reads the policy whenever
-the file changes — **no restart required**.
+Missing paths are only reported *after* a failure, never before: `mkdir`, `git clone` and compiler
+outputs are supposed to name paths that do not exist yet.
 
 ---
 
@@ -336,11 +321,11 @@ the file changes — **no restart required**.
 | Region | Contents |
 |---|---|
 | **Toolbar** | Workspace path · model picker (populated from `/api/tags`) · live connection badge |
-| **Left sidebar** | File explorer (lazy tree, context menu) · session switcher · usage gauges |
+| **Left sidebar** | File explorer (lazy tree, context menu) · agent plan · session switcher |
 | **Centre** | Chat with markdown + syntax-highlighted code, and live **action cards** (`[AGENT] write_file … ✓ 12 ms`) with expandable output |
 | **Right** | Tabbed editor (line numbers, highlighting, dirty markers) + inline / side-by-side **diff viewer** |
 | **Bottom** | Embedded terminal: live agent output *and* your own commands with history |
-| **Status bar** | Agent state · tokens today · request quota |
+| **Status bar** | Agent state · tokens used by the current run |
 
 Shortcuts: `Ctrl+O` open workspace · `Ctrl+Enter` run · `Esc` stop · `Ctrl+S` save · `Ctrl+N` new
 session · `Ctrl+,` settings · ``Ctrl+` `` toggle terminal.
@@ -360,8 +345,6 @@ Everything lives in one per-user folder (override with the `AGENT3_HOME` environ
 ```
 config.json          non-sensitive settings (endpoint, model, agent behaviour, UI state)
 credentials.enc      AES-256-GCM encrypted GitHub token
-limits.policy.enc    AES-256-GCM encrypted quota policy
-usage.sqlite3        telemetry (requests, tokens, runtime, tool calls, errors)
 sessions.sqlite3     chat history
 logs/agent3.log      rotating log (5 × 2 MiB)
 crashes/             unhandled-exception dumps
@@ -382,17 +365,16 @@ AGENT3_OLLAMA_HOST=127.0.0.1 AGENT3_OLLAMA_PORT=11435 AGENT3_OLLAMA_MODEL=... py
 
 1. **test** (ubuntu) — installs the Qt runtime libraries, runs the full pytest suite headless
    (`QT_QPA_PLATFORM=offscreen`) with coverage, then byte-compiles every module.
-2. **build-windows** — freezes `Agent3.exe` and `UsageLimitEditor.exe` with PyInstaller, validates
-   that both binaries exist and are of a plausible size, and uploads three artifacts
-   (each `.exe` separately plus `Agent3-windows-x64.zip` with `INSTALL.txt`, `README.md`, `LICENSE`).
+2. **build-windows** — freezes `Agent3.exe` with PyInstaller, validates that the binary exists, is
+   of a plausible size and answers `--version`, then uploads two artifacts (the `.exe` itself plus
+   `Agent3-windows-x64.zip` with `INSTALL.txt`, `README.md`, `LICENSE`).
 3. **release** — on a `v*` tag or `create_release: true`, publishes a **draft** GitHub Release with
    the artifacts attached.
 
 Build locally with:
 
 ```bash
-python packaging/build.py --clean          # both targets
-python packaging/build.py --only agent     # just Agent3
+python packaging/build.py --clean          # freeze Agent3.exe
 ```
 
 ---
@@ -405,7 +387,7 @@ pytest -q tests/test_agent.py               # the agent loop
 QT_QPA_PLATFORM=offscreen pytest -q -m gui  # Qt widgets only
 ```
 
-The suite covers the sandbox escape attempts, the deny-listed commands, every quota rule, the
+The suite covers the sandbox escape attempts, the deny-listed commands, the path/shell guard, the
 streaming/retry/fallback behaviour of the Ollama client (with a scripted fake transport), the tool
 protocol parser, the self-correcting loop (with a scripted fake model) and a headless smoke test of
 every widget — no Ollama server and no display required.

@@ -1,8 +1,8 @@
 """Operating-system aware location resolution for Agent3 data files.
 
-All mutable state (configuration, quota policy, usage database, logs, chat
-sessions) lives in a single per-user application directory so that the frozen
-executables never write next to themselves - a requirement when the ``.exe``
+All mutable state (configuration, credentials, logs, chat sessions) lives in
+a single per-user application directory so that the frozen executable never
+writes next to itself - a requirement when the ``.exe``
 is installed into ``Program Files`` or launched from a read-only share.
 
 The directory can be overridden with the ``AGENT3_HOME`` environment variable,
@@ -47,18 +47,9 @@ class AppPaths:
         return self.base / "config.json"
 
     @property
-    def policy_file(self) -> Path:
-        """Encrypted quota policy shared with ``UsageLimitEditor.exe``."""
-        return self.base / "limits.policy.enc"
-
-    @property
     def credentials_file(self) -> Path:
         """Encrypted credential blob (GitHub token, etc.)."""
         return self.base / "credentials.enc"
-
-    @property
-    def usage_db(self) -> Path:
-        return self.base / "usage.sqlite3"
 
     @property
     def sessions_db(self) -> Path:

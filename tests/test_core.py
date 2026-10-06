@@ -23,7 +23,7 @@ class TestAppPaths:
 
     def test_file_locations_are_inside_base(self):
         paths = app_paths()
-        for target in (paths.config_file, paths.policy_file, paths.usage_db, paths.sessions_db):
+        for target in (paths.config_file, paths.credentials_file, paths.sessions_db):
             assert paths.base in target.parents
 
 

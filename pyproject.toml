@@ -23,7 +23,6 @@ dev = ["pytest>=8.3", "pytest-cov>=5.0", "pyinstaller>=6.11"]
 
 [project.scripts]
 agent3 = "agent3.__main__:main"
-agent3-usage-editor = "usage_limit_editor.__main__:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }

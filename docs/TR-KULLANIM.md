@@ -15,8 +15,7 @@ sunucusundan (`http://localhost:11435`) çalışır — hiçbir veri buluta gitm
    (sürüm taslağı istiyorsanız *create_release* kutusunu işaretleyin). Alternatif olarak
    `v1.0.0` gibi bir etiket (tag) gönderin.
 2. İş akışı bitince **`Agent3-windows-x64-bundle`** çıktısını indirip açın. İçinde:
-   - `Agent3.exe` — ana uygulama
-   - `UsageLimitEditor.exe` — yönetici kota aracı
+   - `Agent3.exe` — tek dosyalık ana uygulama (kurulum gerekmez)
    - `INSTALL.txt`, `README.md`, `LICENSE`
 3. [Ollama](https://ollama.com) kurun ve **11435 portunda** başlatın:
 
@@ -40,7 +39,7 @@ python -m venv .venv
 .venv\Scripts\activate         # Linux/macOS: . .venv/bin/activate
 pip install -r requirements-dev.txt
 python -m agent3               # ana uygulama
-python -m usage_limit_editor   # yönetici aracı
+python -m agent3 --self-test   # model olmadan kurulumu doğrular
 ```
 
 ---
@@ -67,12 +66,12 @@ python -m usage_limit_editor   # yönetici aracı
 | Bölge | İçerik |
 |---|---|
 | Üst araç çubuğu | Çalışma klasörü ve menüler |
-| Sol kenar çubuğu | Dosya gezgini · **ajan planı (PLAN)** · oturum listesi · kullanım/kota göstergeleri |
+| Sol kenar çubuğu | Dosya gezgini · **ajan planı (PLAN)** · oturum listesi |
 | Orta panel | Sohbet (markdown + kod vurgulama) ve canlı eylem kartları |
 | **Mesaj kutusunun altındaki şerit** | **Model seçici · düşünme anahtarı · düşünme düzeyi · bağlantı durumu** |
 | Sağ panel | Sekmeli kod düzenleyici + satır içi / yan yana fark görüntüleyici |
 | Alt panel | Gömülü terminal; başlıkta `● N background` rozeti arka planda çalışan süreçleri gösterir |
-| Durum çubuğu | Ajan durumu · bugünkü token · istek kotası |
+| Durum çubuğu | Ajan durumu · o koşuda harcanan token |
 
 ### Model ve düşünme şeridi
 
@@ -241,31 +240,29 @@ bir uyarı düşülür. Kapatmak için `config.json` içinde
 
 ---
 
-## 4. Kullanım limitleri (kurumsal kota)
+## 4. Yol ve komut zekâsı
 
-| Limit | Varsayılan | Açıklama |
-|---|---|---|
-| Günlük istek | 500 | Günde gönderilebilecek LLM isteği |
-| Günlük token | 1.000.000 | Girdi + çıktı toplamı |
-| Oturum başına token | 100.000 | *Yeni oturum* ile sıfırlanır |
-| İstek başına token | 32.000 | Çok büyük istemler gönderilmeden reddedilir |
-| Günlük aktif süre | 4 saat | Modelin çalışma süresi |
-| Günlük ajan koşusu | 100 | Otonom çalıştırma sayısı |
-| Koşu başına araç çağrısı | 60 | Sonsuz döngü koruması |
-| İstekler arası bekleme | 0 sn | Hız sınırlama |
+Küçük yerel modeller kabukta hep aynı dört hatayı yapar. Agent3 bunları artık kendi başına
+yakalıyor, böylece ajan aynı yanlış yolu on kez denemiyor.
 
-`0` değeri **sınırsız** demektir. Sol alttaki göstergeler %80'de sarıya, dolduğunda kırmızıya döner
-ve ajan çalışmayı reddeder.
+| Durum | Ne oluyor |
+|---|---|
+| Windows'ta `mv`, `cp`, `rm`, `ls`, `cat`, `touch`, `grep`, `sed` | Komut **çalıştırılmadan** reddedilir; yerine kullanılacak araç söylenir (`rename_file`, `delete_file`, `list_files`, `read_file`, `search_code`, …) |
+| `cd olmayan-klasor & python app.py` | Çalıştırılmadan reddedilir. `cd` başarısız olsa bile Windows'ta `&` bir sonraki komutu yine çalıştırdığı için bu sessiz bir hatadır; doğru kullanım `cwd` argümanıdır |
+| Komut hata verdi ve içinde olmayan bir yol var | Hata mesajına çalışma klasöründeki **en yakın gerçek yol** eklenir |
+| Yolda boşluk var (`projede Duz/snake_game.py`) | Tırnak içine alınması gerektiği açıkça hatırlatılır |
 
-### UsageLimitEditor.exe (yönetici aracı)
+Örnek: ajan `python projede Duz/snake_game.py` yazarsa, kabuk bunu iki ayrı argümana böler ve
+komut başarısız olur. Agent3 çıktıya şunu ekler:
 
-- Tüm kotaları düzenler, varsayılanlara döndürür.
-- **Yönetici parolası** koyabilirsiniz (PBKDF2 ile saklanır); parola varsa araç açılışta sorar.
-- **Developer mode**: tüm limitleri geçici olarak devre dışı bırakır.
-- Son 21 günün tüketim tablosunu gösterir; bugünün sayaçlarını veya tüm geçmişi silebilir.
-- Politika dosyası **AES-256-GCM** ile şifrelidir; elle kurcalanırsa Agent3 sınırsıza değil,
-  **güvenli varsayılanlara** düşer.
-- Ana uygulama dosya değişince politikayı **anında** yeniden okur, yeniden başlatma gerekmez.
+```
+Komuttaki yollar bu çalışma klasörüyle eşleşmiyor:
+- "Duz/snake_game.py" yok. Gerçek yol "projede Duz/snake_game.py" — içinde boşluk
+  olduğu için komutta tırnak içine alınmalı.
+```
+
+Olmayan yollar yalnızca komut **başarısız olduktan sonra** bildirilir: `mkdir`, `git clone` veya bir
+derleyici çıktısı zaten var olmayan bir yol yazmak zorundadır, bunları baştan engellemek yanlış olurdu.
 
 ---
 
@@ -291,8 +288,6 @@ ve ajan çalışmayı reddeder.
 ```
 config.json          ayarlar (uç nokta, model, ajan davranışı, pencere durumu)
 credentials.enc      şifreli GitHub jetonu
-limits.policy.enc    şifreli kota politikası
-usage.sqlite3        kullanım telemetrisi
 sessions.sqlite3     sohbet geçmişi
 logs/agent3.log      döngüsel günlük dosyası
 crashes/             beklenmeyen hata dökümleri
@@ -308,7 +303,6 @@ crashes/             beklenmeyen hata dökümleri
 |---|---|
 | Bağlantı rozeti kırmızı | `set OLLAMA_HOST=127.0.0.1:11435 && ollama serve` ile sunucuyu başlatın |
 | "Model is not installed" uyarısı | `ollama pull <model>` ile indirin veya listeden kurulu bir model seçin |
-| Ajan hemen duruyor, kırmızı banner var | Kota dolmuş; `UsageLimitEditor` ile limiti yükseltin veya sayaçları sıfırlayın |
 | Araçlar "security violation" döndürüyor | Model çalışma klasörü dışına yazmaya çalıştı — bu bilinçli bir korumadır |
 | Komut 124 koduyla bitti | Zaman aşımı; **Settings → Agent → Command timeout** değerini artırın |
 | Git işlemleri çalışmıyor | `git` PATH'te kurulu olmalı |

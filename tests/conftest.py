@@ -1,7 +1,7 @@
 """Shared pytest fixtures.
 
 Every test runs against an isolated ``AGENT3_HOME`` so the developer's real
-configuration, quota policy and usage database are never touched.
+configuration and session database are never touched.
 """
 
 from __future__ import annotations
@@ -69,15 +69,6 @@ def tool_context(fs, runner, git_repo):
     from agent3.agent.tools import ToolContext
 
     return ToolContext(fs=fs, runner=runner, git=git_repo, command_timeout=30.0)
-
-
-@pytest.fixture
-def usage_manager():
-    from agent3.limits.manager import UsageManager
-
-    manager = UsageManager()
-    yield manager
-    manager.close()
 
 
 def requires_git() -> bool:

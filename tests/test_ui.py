@@ -88,13 +88,6 @@ class TestWidgets:
         chat.add_notice("done", "success")
         chat.clear()
 
-    def test_usage_panel_updates(self, qapp, usage_manager):
-        from agent3.ui.widgets.usage_panel import UsagePanel
-
-        usage_manager.record_request(model="m", prompt_tokens=10, completion_tokens=5, duration_ms=10)
-        panel = UsagePanel()
-        panel.update_snapshot(usage_manager.snapshot())
-
     def test_file_tree_lists_workspace(self, qapp, fs):
         from agent3.ui.widgets.file_tree import WorkspaceTree
 
@@ -176,20 +169,25 @@ class TestMainWindow:
         assert window.fs is not None and window.loop is not None
         assert window.tree.topLevelItemCount() >= 2
         window.editor.open_file("README.md")
-        window.refresh_usage()
         window._describe_call  # attribute exists
         window.close()
 
-    def test_usage_limit_editor_builds(self, qapp):
-        from usage_limit_editor.main_window import UsageLimitEditorWindow
+    def test_the_quota_surface_is_gone(self, qapp, workspace):
+        """The limit engine was removed; no stray hooks may survive."""
+        from agent3.core.config import ConfigManager
+        from agent3.ui.main_window import MainWindow
 
-        window = UsageLimitEditorWindow()
-        assert window._requests_per_day.value() == 500  # noqa: SLF001
-        window._requests_per_day.setValue(250)  # noqa: SLF001
-        window._save()  # noqa: SLF001
-        from agent3.limits.policy import PolicyStore
-
-        assert PolicyStore().load(force=True).max_requests_per_day == 250
+        window = MainWindow(ConfigManager())
+        for attribute in (
+            "usage",
+            "usage_panel",
+            "quota_banner",
+            "refresh_usage",
+            "open_usage_editor",
+            "_show_banner",
+        ):
+            assert not hasattr(window, attribute), f"{attribute} still exists"
+        assert "quota" not in window.statusBar().findChildren(type(window))
         window.close()
 
 

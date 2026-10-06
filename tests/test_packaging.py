@@ -127,14 +127,14 @@ def test_project_root_accepts_file_and_directory() -> None:
 
 
 def test_spec_files_exist_and_are_valid_python() -> None:
-    for name in ("Agent3.spec", "UsageLimitEditor.spec"):
+    for name in ("Agent3.spec",):
         spec = PROJECT_ROOT / "packaging" / name
         assert spec.exists(), f"missing {name}"
         ast.parse(spec.read_text(encoding="utf-8"), filename=str(spec))
 
 
 def test_specs_reference_the_shared_helpers() -> None:
-    for name in ("Agent3.spec", "UsageLimitEditor.spec"):
+    for name in ("Agent3.spec",):
         text = (PROJECT_ROOT / "packaging" / name).read_text(encoding="utf-8")
         assert "EXCLUDED_MODULES" in text
         assert "HIDDEN_IMPORTS" in text

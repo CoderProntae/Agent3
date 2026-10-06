@@ -1,9 +1,9 @@
-"""Build both executables locally (the CI workflow runs the very same steps).
+"""Build the application executable locally (CI runs the very same steps).
 
 Usage::
 
-    python packaging/build.py              # build Agent3 + UsageLimitEditor
-    python packaging/build.py --only agent # build just the main application
+    python packaging/build.py              # build Agent3.exe
+    python packaging/build.py --clean      # wipe build/ and dist/ first
 """
 
 from __future__ import annotations
@@ -22,7 +22,6 @@ BUILD = ROOT / "build"
 
 TARGETS = {
     "agent": ("Agent3", PACKAGING / "Agent3.spec"),
-    "editor": ("UsageLimitEditor", PACKAGING / "UsageLimitEditor.spec"),
 }
 
 

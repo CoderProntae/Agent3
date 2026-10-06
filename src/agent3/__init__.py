@@ -7,8 +7,6 @@ unit tested without a running Qt event loop or a live Ollama server:
     Cross cutting concerns: paths, logging, encrypted storage, configuration.
 ``agent3.llm``
     Transport to the local Ollama inference server plus token accounting.
-``agent3.limits``
-    The enterprise quota / rate limiting engine (SQLite backed).
 ``agent3.workspace``
     Sandboxed filesystem, diffing, terminal execution and git integration.
 ``agent3.agent``

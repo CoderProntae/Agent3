@@ -1,18 +1,18 @@
-"""Authenticated, encrypted JSON storage used for quotas and credentials.
+"""Authenticated, encrypted JSON storage for local credentials.
 
 Design notes
 ------------
 * **AES-256-GCM** provides confidentiality *and* integrity, so a user cannot
-  silently hand-edit the quota file to lift enterprise limits - any tampering
-  makes decryption fail loudly (:class:`SecureStoreError`).
+  silently hand-edit the stored secrets - any tampering makes decryption
+  fail loudly (:class:`SecureStoreError`).
 * The key is derived with **PBKDF2-HMAC-SHA256** (390k iterations) from either
-  an administrator passphrase or, when no passphrase is configured, from a
-  machine-bound default secret.  That keeps the "it just works" first-run
-  experience while still allowing an admin to lock the policy down.
+  a user passphrase or, when none is configured, from a machine-bound
+  default secret.  That keeps the "it just works" first-run experience while
+  still allowing the store to be locked down.
 * The on-disk envelope is plain JSON so that the format stays debuggable and
   forward compatible (``v`` field).
 * Writes are atomic (temp file + ``os.replace``) which matters because the main
-  application and ``UsageLimitEditor.exe`` touch the same files concurrently.
+  application and an external editor touch the same files concurrently.
 """
 
 from __future__ import annotations
@@ -139,7 +139,7 @@ class SecureStore:
 
         ``default`` is returned when the file does not exist yet.  A corrupt or
         wrongly-keyed file always raises :class:`SecureStoreError` - silently
-        falling back to defaults would be a quota bypass.
+        falling back to defaults would hide a corrupted secret.
         """
         if not self._path.is_file():
             return dict(default) if default is not None else {}
