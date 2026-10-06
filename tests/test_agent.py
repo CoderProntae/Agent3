@@ -403,12 +403,22 @@ class TestAgentLoop:
         assert result.stop_reason is AgentStopReason.CANCELLED
         assert result.tool_calls == 1
 
-    def test_system_prompt_contains_workspace_and_tools(self, tool_context):
+    def test_the_system_prompt_carries_only_invariants(self, tool_context):
+        """Message 0 must not mention anything that changes between runs."""
         _client, loop = self.build([], tool_context)
         prompt = loop.system_prompt()
-        assert str(tool_context.fs.root) in prompt
         assert "write_file" in prompt and "finish" in prompt
-        assert "app.py" in prompt
+        assert str(tool_context.fs.root) not in prompt
+        assert "app.py" not in prompt
+        assert "## Project tree" not in prompt
+
+    def test_the_workspace_snapshot_travels_in_the_conversation(self, tool_context):
+        _client, loop = self.build([tool_block("finish", summary="ok")], tool_context)
+        loop.run("go")
+        first_user_turn = loop.history[0].content
+        assert str(tool_context.fs.root) in first_user_turn
+        assert "app.py" in first_user_turn
+        assert "go" in first_user_turn
 
 
 # ------------------------------------------------------------------- sessions

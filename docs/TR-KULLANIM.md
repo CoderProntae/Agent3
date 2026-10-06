@@ -164,21 +164,38 @@ varsayılan olarak kapalıdır, tıklayarak açarsınız.
 
 ### Neden bazen geç yanıt veriyordu?
 
-llama.cpp KV önbelleğini yalnızca iki istemin **ortak ön ekine** uygular. Bu
-yüzden istem düzeni Agent3'te bir performans sözleşmesidir:
+Yerel sunucu KV önbelleğini yalnızca iki istemin **ortak ön ekine** uygular.
+6 GB'lık bir kartta 9B model, istem işlemeyi saniyede ~50 token hızında yapar;
+yani ön eki kaybetmek dakikalara mal olur. Bu yüzden bağlam düzeni Agent3'te
+bir performans sözleşmesidir. Üç kural:
 
-* değişmeyen ~2700 token (kimlik, kurallar, araç kataloğu, çıktı biçimi) **en
-  başta**; çalışma alanı fotoğrafı (ağaç, git durumu, tarih) **en sonda**;
-* fotoğraf **tur başına bir kez** üretilir ve adımlar arasında sabit tutulur —
-  dosya oluşturan bir adım artık 0 numaralı mesajı yeniden yazmaz;
-* ortam satırında yalnızca tarih vardır; her dakika değişen bir saat tek
-  başına önbelleği geçersiz kılardı.
+1. **0 numaralı mesaj asla değişmez.** Sistem istemi kimlik, kurallar, araç
+   kataloğu ve çıktı sözleşmesinden ibarettir: her adımda, her turda ve her
+   çalışma klasöründe bayt bayt aynı olan ~2500 token.
+2. **Değişken durum araya yazılmaz, sona eklenir.** Çalışma alanı fotoğrafı
+   (ağaç, git durumu, tarih) artık her turun kullanıcı mesajının başında bir
+   **sohbet turu** olarak gider. Böylece yeni bir ağaç, ağacın token'ı kadar
+   maliyetlidir — tüm konuşmanın token'ı kadar değil.
+3. **Bağlam penceresinin sol kenarı sabittir.** Akla ilk gelen sınır olan
+   `history[-40:]`, konuşma uzadığında her adımda en eski mesajı atar; her
+   atış geri kalanı kaydırdığı için ön ek **her adımda** çöper. Agent3'ün
+   penceresi bunun yerine bütçesine kadar büyür, sonra %60'ına geri düşer:
+   pahalı adım her mesajda değil, ~16 mesajda bir yaşanır.
 
-Bu düzeltme olmadan sunucu her adımda
-`forcing full prompt re-processing due to lack of cache data` yazıp ilk
-token'dan önce 15-20 saniye harcıyordu — ekrandan bakınca donmuş bir
-uygulamadan farksızdır. Gerçek araç kataloğuyla ölçüldüğünde yeniden
-kullanılabilir ön ek **48 token'dan 2726 token'a** çıktı.
+Her iki hata da gerçek bir llama.cpp logunda bulundu:
+
+```
+slot get_availabl: - checking sim = 0.177 (2524/14252)
+slot print_timing: prompt processing ... 50 tokens per second
+```
+
+Eşleşen 2524 token tam olarak sabit ön ekti; kalan 11 728 token yeniden
+hesaplandı — yanıtın ilk token'ından önce yaklaşık **dört dakika**. 40
+mesajlık pencereyle 120 mesajlık bir konuşmada iki düzeltme birlikte yeniden
+işlenen token'ı **%93** azaltıyor (905 614 → 65 436).
+
+Ortam satırında ayrıca yalnızca tarih vardır; her dakika değişen bir saat tek
+başına önbelleği geçersiz kılardı.
 
 Düşünme izi gizliyken durum çubuğu karakter sayısını yazar; böylece bir dakika
 düşünen bir model asla "takılmış" gibi görünmez.

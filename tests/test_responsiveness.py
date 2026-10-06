@@ -117,6 +117,151 @@ class TestFrozenSystemPrompt:
         assert loop._renders == 2
 
 
+class TestContextPrefixIsStable:
+    """The KV cache survives both of the things that used to destroy it.
+
+    A real llama.cpp log from a 9B model with a 16k context::
+
+        slot get_availabl: - checking sim = 0.177 (2524/14252)
+        slot print_timing: prompt processing ... 50 tokens per second
+
+    2524 tokens matched - exactly the static prefix - so 11728 tokens were
+    re-evaluated at ~50 t/s: almost four minutes of silence before the
+    answer started. Two separate causes, one test class.
+    """
+
+    def _loop(self, tmp_path, *, history_window=10):
+        from agent3.agent.loop import AgentLoop, AgentSettings
+        from agent3.agent.tools import ToolContext, ToolRegistry
+        from agent3.workspace.fs import WorkspaceFS
+        from agent3.workspace.git_ops import GitRepo
+        from agent3.workspace.terminal import CommandRunner
+
+        root = tmp_path / "ws"
+        (root / "src").mkdir(parents=True)
+        (root / "src" / "a.py").write_text("print(1)\n")
+        fs = WorkspaceFS(root)
+        context = ToolContext(
+            fs=fs,
+            runner=CommandRunner(root, default_timeout=5.0),
+            git=GitRepo(root),
+            command_timeout=5.0,
+        )
+        return AgentLoop(
+            None,
+            ToolRegistry(),
+            context,
+            AgentSettings(history_window=history_window),
+            model="m",
+        )
+
+    # ------------------------------------------- cause 1: the tree in msg 0
+    def test_writing_a_file_does_not_change_the_system_prompt(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            loop = self._loop(Path(tmp))
+            before = loop.system_prompt()
+            (loop.context.fs.root / "src" / "brand_new.py").write_text("x = 1\n")
+            loop.refresh_system_prompt()
+            assert loop.system_prompt() == before
+
+    def test_the_snapshot_is_still_shown_to_the_model(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            loop = self._loop(Path(tmp))
+            block = loop.environment_block()
+            assert "a.py" in block
+            assert str(loop.context.fs.root) in block
+            assert block not in loop.system_prompt()
+
+    def test_two_workspaces_share_the_system_prompt(self):
+        """Message 0 is invariant across sessions, not just across steps."""
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as one, tempfile.TemporaryDirectory() as two:
+            assert self._loop(Path(one)).system_prompt() == (
+                self._loop(Path(two)).system_prompt()
+            )
+
+    # --------------------------------------- cause 2: the sliding window
+    def _window_text(self, loop):
+        """The conversation half of the window.
+
+        Deliberately excludes the system message: it is ~10k characters of
+        invariant text and would dominate any prefix measurement, hiding
+        exactly the regression this class exists to catch.
+        """
+        return "\u0000".join(m.content for m in loop._window()[1:])  # noqa: SLF001
+
+    def test_a_long_conversation_keeps_its_prefix_between_steps(self):
+        from agent3.llm.ollama_client import ChatMessage
+
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            loop = self._loop(Path(tmp), history_window=10)
+            evictions = 0
+            previous = ""
+            for step in range(40):
+                loop.history.append(ChatMessage.user(f"step {step}"))
+                current = self._window_text(loop)
+                if previous:
+                    shared = len(os.path.commonprefix([previous, current]))
+                    if shared < len(previous) * 0.9:
+                        evictions += 1
+                previous = current
+            # A sliding window evicts on every step past the limit (~30 of
+            # these 40); batched eviction must be far rarer.
+            assert evictions <= 6, f"{evictions} cache-destroying evictions"
+
+    def test_the_window_still_respects_its_budget(self):
+        from agent3.llm.ollama_client import ChatMessage
+
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            loop = self._loop(Path(tmp), history_window=10)
+            for step in range(60):
+                loop.history.append(ChatMessage.user(f"step {step}"))
+                # +1 for the system message
+                assert len(loop._window()) <= 10 + 1  # noqa: SLF001
+
+    def test_the_newest_turn_is_always_in_the_window(self):
+        from agent3.llm.ollama_client import ChatMessage
+
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            loop = self._loop(Path(tmp), history_window=8)
+            for step in range(40):
+                loop.history.append(ChatMessage.user(f"step {step}"))
+                assert loop._window()[-1].content == f"step {step}"  # noqa: SLF001
+
+    def test_a_new_session_resets_the_anchor(self):
+        from agent3.llm.ollama_client import ChatMessage
+
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            loop = self._loop(Path(tmp), history_window=8)
+            for step in range(30):
+                loop.history.append(ChatMessage.user(f"step {step}"))
+                loop._window()  # noqa: SLF001
+            assert loop._window_start > 0  # noqa: SLF001
+            loop.reset()
+            assert loop._window_start == 0  # noqa: SLF001
+
+
+
 try:
     from PySide6.QtWidgets import QApplication, QWidget
 except ImportError:  # pragma: no cover - headless CI without Qt libs

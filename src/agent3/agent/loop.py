@@ -23,7 +23,8 @@ from agent3.agent.prompts import (
     RETRY_HINT,
     VERIFY_HINT,
     build_observation,
-    build_system_prompt,
+    build_environment_block,
+    build_stable_prefix,
     build_user_request,
 )
 from agent3.agent.tools import ToolCall, ToolContext, ToolRegistry, ToolResult, parse_tool_calls, strip_tool_calls
@@ -133,6 +134,9 @@ class AgentLoop:
         self._think_warning_sent = False
         #: Frozen system prompt for the current run (see :meth:`system_prompt`).
         self._system_prompt: Optional[str] = None
+        #: Left edge of the context window. Monotonic within a conversation
+        #: so the cached prefix survives; see :meth:`_window`.
+        self._window_start = 0
         #: Reasoning spec forwarded to Ollama's ``think`` field. ``None`` means
         #: "use whatever the connection settings say".
         self.think: Optional[str] = None
@@ -162,39 +166,47 @@ class AgentLoop:
         """Forget the conversation (new session)."""
         self.history.clear()
         self._cancel.clear()
+        self._window_start = 0
         self.refresh_system_prompt()
 
     def load_history(self, messages: Sequence[ChatMessage]) -> None:
         """Restore a persisted conversation."""
         self.history = [m for m in messages if m.role is not Role.SYSTEM]
+        self._window_start = 0
 
     # -------------------------------------------------------------- prompt
     def system_prompt(self) -> str:
-        """The system prompt for the current run, rendered at most once.
+        """The system message - identical on every step, run and session.
 
-        Re-rendering this between steps used to be the single biggest source
-        of latency. The block contains the workspace tree and the git state,
-        both of which change the moment the agent writes a file, so every
-        step produced a different message 0 - and llama.cpp, which can only
-        reuse the KV cache for a common *prefix*, threw the entire cached
-        conversation away and re-evaluated thousands of tokens::
+        An inference server can only reuse its KV cache for a common
+        *prefix*. Message 0 therefore has to be invariant, and for a long
+        time it was not: it carried the workspace tree and the git state,
+        both of which change the moment the agent writes a file. One
+        `write_file` invalidated the whole conversation.
 
-            forcing full prompt re-processing due to lack of cache data
-            prompt eval time = 22375 ms / 3181 tokens
-
-        Freezing the snapshot for the duration of a run costs nothing in
-        accuracy - the agent already knows what it changed, because it is in
-        the conversation - and turns that 20 s stall into a cache hit.
+        The workspace snapshot now travels as a conversation turn
+        (:func:`build_environment_block`), appended where new tokens go
+        anyway, so nothing here ever changes while a workspace is mounted.
         """
         if self._system_prompt is None:
             self._system_prompt = self._render_system_prompt()
         return self._system_prompt
 
     def refresh_system_prompt(self) -> None:
-        """Drop the frozen snapshot so the next step re-reads the workspace."""
+        """Drop the cached render (tools or project instructions changed)."""
         self._system_prompt = None
 
     def _render_system_prompt(self) -> str:
+        prompt = build_stable_prefix(self.registry.describe())
+        if self.extra_instructions.strip():
+            prompt += (
+                f"\n## Additional project instructions\n"
+                f"{self.extra_instructions.strip()}\n"
+            )
+        return prompt
+
+    def environment_block(self) -> str:
+        """Snapshot of the workspace, rendered fresh at the start of a run."""
         fs = self.context.fs
         try:
             tree = fs.tree_text(max_depth=3, max_entries=300)
@@ -208,32 +220,49 @@ class AgentLoop:
                 git_state = f"yes (branch: {branch}, {dirty})"
         except Exception:  # pragma: no cover
             pass
-        return build_system_prompt(
-            workspace=str(fs.root),
-            tools=self.registry.describe(),
-            tree=tree,
-            git_state=git_state,
-            extra_instructions=self.extra_instructions,
+        return build_environment_block(
+            workspace=str(fs.root), tree=tree, git_state=git_state
         )
 
     def _window(self) -> List[ChatMessage]:
-        """System prompt + a bounded slice of the conversation."""
+        """System prompt + a bounded, *prefix-stable* slice of the history.
+
+        The obvious bounded window - ``history[-window:]`` - drops one
+        message per step once the conversation is long enough. Every drop
+        shifts the whole remaining context, which destroys the cached prefix
+        on *every single step*: the same full re-evaluation the static
+        system prompt was meant to avoid.
+
+        So the window has a fixed left edge that only moves in batches. It
+        grows until it exceeds the budget, then jumps back to 60 % of it.
+        One expensive step every ~40 % of a window, instead of each one.
+        """
         window = max(6, int(self.settings.history_window))
-        tail = self.history[-window:]
+        if len(self.history) - self._window_start > window:
+            keep = max(6, int(window * 0.6))
+            self._window_start = max(self._window_start, len(self.history) - keep)
+        self._window_start = min(self._window_start, max(0, len(self.history) - 1))
+        tail = self.history[self._window_start :]
         return [ChatMessage.system(self.system_prompt()), *tail]
 
     # ----------------------------------------------------------------- run
     def run(self, user_message: str, *, context_hint: str = "") -> AgentRunResult:
         """Execute one autonomous run for *user_message*."""
         self._cancel.clear()
-        # One fresh workspace snapshot per run, then hold it steady so the
-        # server can keep reusing the prompt cache between steps.
-        self.refresh_system_prompt()
         started = time.monotonic()
         result = AgentRunResult(stop_reason=AgentStopReason.ERROR)
 
+        # The workspace snapshot is *appended*, never edited into message 0:
+        # a fresh tree then costs the tokens of the tree, not the tokens of
+        # the entire conversation.
         self.history.append(
-            ChatMessage.user(build_user_request(user_message, context=context_hint or None))
+            ChatMessage.user(
+                build_user_request(
+                    user_message,
+                    context=context_hint or None,
+                    environment=self.environment_block(),
+                )
+            )
         )
 
         max_iterations = max(1, int(self.settings.max_iterations))

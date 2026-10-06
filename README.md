@@ -184,22 +184,39 @@ collapsed block in the transcript.
 
 ### Prompt cache and latency
 
-llama.cpp reuses its KV cache only for the longest common **prefix** of two
-consecutive prompts. Agent3 therefore treats prompt layout as a performance
-contract:
+A local inference server reuses its KV cache only for the longest common
+**prefix** of two consecutive prompts. On a 6 GB card running a 9B model at
+~50 tokens/second of prompt processing, losing that prefix costs minutes, so
+Agent3 treats context layout as a performance contract. Three rules:
 
-* the invariant ~2700 tokens (identity, rules, tool catalogue, output format)
-  come first, and the workspace snapshot - tree, git state, date - goes last;
-* the snapshot is rendered **once per run** and held steady between steps, so
-  a step that created a file does not rewrite message 0;
-* the environment line carries the date only, never a clock that would tick
-  the cache away on its own.
+1. **Message 0 never changes.** The system prompt holds identity, rules, the
+   tool catalogue and the output contract - roughly 2500 tokens that are
+   byte-identical across every step, every run and every workspace.
+2. **Volatile state is appended, never edited in.** The workspace snapshot
+   (tree, git state, date) is a *conversation turn* at the head of each run's
+   user message, so a fresh tree costs the tokens of the tree instead of the
+   tokens of the whole conversation.
+3. **The context window has a fixed left edge.** The obvious bound,
+   `history[-40:]`, drops one message per step once the conversation is long
+   enough - and every drop shifts the remainder, destroying the prefix on
+   *every single step*. Agent3's window instead grows to its budget and then
+   jumps back to 60 % of it, so the expensive step happens once per ~16
+   messages rather than once per message.
 
-Without this the server logs `forcing full prompt re-processing due to lack
-of cache data` and spends 15-20 s re-evaluating the conversation before the
-first token of every step - which is indistinguishable from a frozen UI.
-Measured on the real tool catalogue, the reusable prefix goes from **48** to
-**2726** tokens.
+Both bugs were found in a real llama.cpp log:
+
+```
+slot get_availabl: - checking sim = 0.177 (2524/14252)
+slot print_timing: prompt processing ... 50 tokens per second
+```
+
+2524 tokens matched - exactly the static prefix - so 11 728 had to be
+recomputed: nearly four minutes before the first token of the answer. Over a
+120-message conversation with a 40-message window, the two fixes together cut
+re-processed tokens by **93 %** (905 614 → 65 436).
+
+The environment line also carries the date only, never a clock that would tick
+the cache away on its own.
 
 While a hidden reasoning trace is streaming, the status bar reports the
 character count, so a model that thinks for a minute before answering never
