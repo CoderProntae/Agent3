@@ -20,6 +20,9 @@ from agent3.ui.theme import COLORS, mono_font
 from agent3.workspace.diffing import diff_stats, parse_unified_diff, side_by_side
 
 
+EMPTY_TITLE = "No changes to display"
+
+
 class DiffView(QWidget):
     """Renders a unified diff; can switch to a two column layout."""
 
@@ -35,12 +38,16 @@ class DiffView(QWidget):
         layout.setSpacing(0)
 
         bar = QFrame()
-        bar.setStyleSheet(f"background-color: {COLORS.bg_alt}; border-bottom: 1px solid {COLORS.border};")
+        bar.setStyleSheet(
+            f"QFrame {{ background-color: {COLORS.bg_alt};"
+            f" border-bottom: 1px solid {COLORS.border_soft}; }}"
+            f"QFrame QLabel {{ background: transparent; }}"
+        )
         bar_layout = QHBoxLayout(bar)
-        bar_layout.setContentsMargins(10, 5, 10, 5)
-        bar_layout.setSpacing(8)
+        bar_layout.setContentsMargins(12, 6, 10, 6)
+        bar_layout.setSpacing(9)
 
-        self._title = QLabel("No changes to display")
+        self._title = QLabel(EMPTY_TITLE)
         self._title.setStyleSheet(f"color: {COLORS.text_dim};")
         bar_layout.addWidget(self._title, 1)
 
@@ -59,8 +66,26 @@ class DiffView(QWidget):
         self._browser.setFont(mono_font(10))
         self._browser.setFrameShape(QFrame.Shape.NoFrame)
         self._browser.setLineWrapMode(QTextBrowser.LineWrapMode.NoWrap)
-        self._browser.setStyleSheet(f"background-color: {COLORS.bg}; color: {COLORS.text};")
+        self._browser.setStyleSheet(
+            f"background-color: {COLORS.bg}; color: {COLORS.text}; padding: 6px 2px;"
+        )
         layout.addWidget(self._browser, 1)
+        self._show_empty_state()
+
+    def _show_empty_state(self) -> None:
+        """Explain the blank panel instead of leaving a black rectangle."""
+        # Diffs are rendered without wrapping so columns line up; prose has
+        # to wrap or it runs straight off the edge of the panel.
+        self._browser.setLineWrapMode(QTextBrowser.LineWrapMode.WidgetWidth)
+        self._browser.setHtml(
+            f'<div style="color:{COLORS.text_faint};padding:28px 22px;'
+            f'line-height:165%;">'
+            f'<div style="font-size:11pt;color:{COLORS.text_dim};">'
+            f"Nothing to review yet</div>"
+            f"<div>Every file the agent writes shows up here as a coloured "
+            f"diff, and you can open any file from the explorer to read it "
+            f"side by side.</div></div>"
+        )
 
     # --------------------------------------------------------------- api
     def show_diff(self, path: str, unified: str, old_text: str = "", new_text: str = "") -> None:
@@ -78,12 +103,13 @@ class DiffView(QWidget):
     def clear(self) -> None:
         self._unified = ""
         self._path = ""
-        self._title.setText("No changes to display")
+        self._title.setText(EMPTY_TITLE)
         self._stats.setText("")
-        self._browser.setHtml("")
+        self._show_empty_state()
 
     # ----------------------------------------------------------- render
     def _render(self) -> None:
+        self._browser.setLineWrapMode(QTextBrowser.LineWrapMode.NoWrap)
         if not self._unified:
             self._browser.setHtml(
                 f"<div style='color:{COLORS.text_faint};padding:16px'>No diff selected.</div>"

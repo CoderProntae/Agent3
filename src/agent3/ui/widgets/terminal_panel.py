@@ -66,14 +66,19 @@ class TerminalPanel(QWidget):
 
         bar = QFrame()
         bar.setStyleSheet(
-            f"background-color: {COLORS.bg_alt}; border-bottom: 1px solid {COLORS.border};"
+            f"QFrame {{ background-color: {COLORS.bg_alt};"
+            f" border-bottom: 1px solid {COLORS.border_soft}; }}"
+            f"QFrame QLabel {{ background: transparent; }}"
         )
         bar_layout = QHBoxLayout(bar)
-        bar_layout.setContentsMargins(10, 4, 8, 4)
-        bar_layout.setSpacing(8)
+        bar_layout.setContentsMargins(14, 6, 10, 6)
+        bar_layout.setSpacing(9)
 
         title = QLabel("TERMINAL")
-        title.setStyleSheet(f"color: {COLORS.text_dim}; font-weight: 600; letter-spacing: 1px;")
+        title.setStyleSheet(
+            f"color: {COLORS.text_faint}; font-weight: 700; font-size: 8pt;"
+            f" letter-spacing: 1.4px;"
+        )
         bar_layout.addWidget(title, 0)
 
         self._cwd_label = QLabel("")
@@ -108,7 +113,12 @@ class TerminalPanel(QWidget):
         self._output.setFrameShape(QFrame.Shape.NoFrame)
         self._output.setStyleSheet(
             f"QPlainTextEdit {{ background-color: {COLORS.bg}; color: {COLORS.text_dim};"
-            f" border: none; }}"
+            f" border: none; padding: 8px 12px; }}"
+        )
+        # An empty console is a large black rectangle with nothing to say for
+        # itself; the placeholder explains what will appear there.
+        self._output.setPlaceholderText(
+            "Command output appears here - both the agent's and your own."
         )
         layout.addWidget(self._output, 1)
 

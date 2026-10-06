@@ -14,7 +14,7 @@ Layout
     +------------+--------------------------------+------------------+
     | Terminal console                                               |
     +----------------------------------------------------------------+
-    | status bar: agent state | tokens this run                      |
+    | status bar: agent state                                        |
     +----------------------------------------------------------------+
 """
 
@@ -123,8 +123,6 @@ class MainWindow(QMainWindow):
         #: Reasoning characters swallowed while the trace is hidden,
         #: surfaced in the status bar so a long silent think is visible.
         self._hidden_thinking_chars = 0
-        #: Tokens spent by the run in progress, shown in the status bar.
-        self._run_tokens = 0
         self._current_session_id = ""
 
         self.setWindowTitle(f"{APP_NAME} - Autonomous Coding Workspace")
@@ -145,17 +143,14 @@ class MainWindow(QMainWindow):
         self.addToolBar(self.toolbar)
 
         self._workspace_label = QLabel("No workspace mounted")
-        self._workspace_label.setStyleSheet(f"color: {COLORS.text_dim}; padding: 0 8px;")
+        self._workspace_label.setStyleSheet(
+            f"color: {COLORS.text_dim}; background: transparent; padding: 0 4px;"
+        )
         self.toolbar.addWidget(self._workspace_label)
-        self.toolbar.addSeparator()
 
         # The model picker and the reasoning controls deliberately do NOT live
         # here: they belong next to the box you type in, so they are built as
         # part of the composer strip further down.
-
-        spacer = QWidget()
-        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        self.toolbar.addWidget(spacer)
 
         # ------------------------------------------------------- sidebar
         self.tree = WorkspaceTree()
@@ -170,8 +165,13 @@ class MainWindow(QMainWindow):
         #: Live view of the plan the agent maintains with `manage_tasks`.
         self.task_panel = TaskPanel()
 
-        explorer_header = QLabel("EXPLORER")
-        explorer_header.setObjectName("SectionTitle")
+        explorer_header = QWidget()
+        explorer_header.setObjectName("SectionHeader")
+        explorer_header_layout = QHBoxLayout(explorer_header)
+        explorer_header_layout.setContentsMargins(14, 8, 12, 8)
+        explorer_title = QLabel("EXPLORER")
+        explorer_title.setObjectName("SectionTitle")
+        explorer_header_layout.addWidget(explorer_title, 1)
 
         sidebar = QSplitter(Qt.Orientation.Vertical)
         explorer_box = QWidget()
@@ -183,8 +183,9 @@ class MainWindow(QMainWindow):
         sidebar.addWidget(explorer_box)
         sidebar.addWidget(self.task_panel)
         sidebar.addWidget(self.session_list)
-        sidebar.setSizes([420, 280, 280])
-        sidebar.setMinimumWidth(240)
+        sidebar.setSizes([460, 250, 270])
+        sidebar.setMinimumWidth(230)
+        sidebar.setHandleWidth(8)
 
         # ---------------------------------------------------------- chat
         self.chat = ChatView()
@@ -199,8 +200,6 @@ class MainWindow(QMainWindow):
         self.composer_bar.model_changed.connect(self._on_model_changed)
         self.composer_bar.think_changed.connect(self._on_think_changed)
 
-        composer_row = QHBoxLayout()
-        composer_row.setSpacing(8)
         self._run_button = QPushButton("Run agent  (Ctrl+Enter)")
         self._run_button.setObjectName("Primary")
         self._run_button.clicked.connect(self.send_message)
@@ -210,18 +209,23 @@ class MainWindow(QMainWindow):
         self._stop_button.clicked.connect(self.stop_agent)
         self._status_chip = QLabel("idle")
         self._status_chip.setObjectName("StatusBadge")
+
+        # One strip under the input instead of three stacked ones: what you
+        # tune per message on the left, what you press on the right.
+        composer_row = QHBoxLayout()
+        composer_row.setSpacing(10)
+        composer_row.setContentsMargins(0, 0, 0, 0)
+        composer_row.addWidget(self.composer_bar, 1)
         composer_row.addWidget(self._status_chip, 0)
-        composer_row.addStretch(1)
         composer_row.addWidget(self._stop_button, 0)
         composer_row.addWidget(self._run_button, 0)
 
         center = QWidget()
         center_layout = QVBoxLayout(center)
-        center_layout.setContentsMargins(8, 8, 8, 8)
-        center_layout.setSpacing(8)
+        center_layout.setContentsMargins(4, 4, 6, 8)
+        center_layout.setSpacing(9)
         center_layout.addWidget(self.chat, 1)
         center_layout.addWidget(self.composer, 0)
-        center_layout.addWidget(self.composer_bar, 0)
         center_layout.addLayout(composer_row)
 
         # -------------------------------------------------------- editor
@@ -234,9 +238,13 @@ class MainWindow(QMainWindow):
         # The conversation is the primary surface, so it gets the largest
         # share and grows fastest; the editor/diff pane is a companion view.
         self.main_splitter.setStretchFactor(0, 0)
-        self.main_splitter.setStretchFactor(1, 5)
+        self.main_splitter.setStretchFactor(1, 6)
         self.main_splitter.setStretchFactor(2, 3)
-        self.main_splitter.setSizes([280, 830, 570])
+        self.main_splitter.setHandleWidth(8)
+        # The editor starts narrow because it is empty until a file is
+        # opened; an empty 570px panel next to the conversation was the
+        # single biggest source of dead space in the window.
+        self.main_splitter.setSizes([275, 980, 425])
 
         # ------------------------------------------------------ terminal
         self.terminal = TerminalPanel()
@@ -244,21 +252,20 @@ class MainWindow(QMainWindow):
         self.vertical_splitter = QSplitter(Qt.Orientation.Vertical)
         self.vertical_splitter.addWidget(self.main_splitter)
         self.vertical_splitter.addWidget(self.terminal)
-        self.vertical_splitter.setStretchFactor(0, 4)
+        self.vertical_splitter.setStretchFactor(0, 5)
         self.vertical_splitter.setStretchFactor(1, 1)
-        self.vertical_splitter.setSizes([720, 220])
+        self.vertical_splitter.setHandleWidth(8)
+        self.vertical_splitter.setSizes([790, 170])
         self.setCentralWidget(self.vertical_splitter)
 
         # ----------------------------------------------------- statusbar
         status = QStatusBar()
         self.setStatusBar(status)
         self._status_text = QLabel("Ready")
-        self._status_tokens = QLabel("tokens: 0")
-        for widget in (self._status_text,):
-            status.addWidget(widget, 1)
-        for widget in (self._status_tokens,):
-            widget.setStyleSheet(f"color: {COLORS.text_faint}; padding: 0 10px;")
-            status.addPermanentWidget(widget, 0)
+        self._status_text.setStyleSheet(f"color: {COLORS.text_dim}; padding: 0 6px;")
+        status.addWidget(self._status_text, 1)
+        #: Text to restore once a transient status message expires.
+        self._status_resting = "Ready"
 
     def _build_actions(self) -> None:
         file_menu = self.menuBar().addMenu("&File")
@@ -336,6 +343,22 @@ class MainWindow(QMainWindow):
         logs_action = QAction("Open log folder", self)
         logs_action.triggered.connect(self._open_logs)
         tools_menu.addAction(logs_action)
+
+        # The toolbar used to hold a path and nothing else. The four actions
+        # people reach for between prompts live there now, so the strip earns
+        # the room it takes.
+        self.toolbar.addSeparator()
+        for action in (new_session_action, run_action, stop_action):
+            self.toolbar.addAction(action)
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.toolbar.addWidget(spacer)
+        for action in (
+            self._toggle_terminal_action,
+            self._toggle_editor_action,
+            settings_action,
+        ):
+            self.toolbar.addAction(action)
 
         help_menu = self.menuBar().addMenu("&Help")
         about_action = QAction("About Agent3", self)
@@ -432,7 +455,7 @@ class MainWindow(QMainWindow):
         self.config_manager.save()
         if self.loop is not None:
             self.loop.think = spec
-        self.statusBar().showMessage(self.composer_bar.thinking_summary(), 2500)
+        self._flash(self.composer_bar.thinking_summary(), 2500)
 
     # ========================================================== workspace
     def choose_workspace(self) -> None:
@@ -499,7 +522,7 @@ class MainWindow(QMainWindow):
         branch = self.git.current_branch() if self.git.is_repo() else ""
         suffix = f" (git: {branch})" if branch else " (not a git repository)"
         self.chat.add_notice(f"Workspace mounted: {fs.root}{suffix}", "success")
-        self.statusBar().showMessage(f"Workspace: {fs.root}", 5000)
+        self._flash(f"Workspace: {fs.root}", 5000)
 
     def _open_file(self, relative: str) -> None:
         self.editor.open_file(relative)
@@ -520,8 +543,6 @@ class MainWindow(QMainWindow):
         self._refresh_sessions()
         if not silent:
             self.chat.add_notice("New session started.", "system")
-        self._run_tokens = 0
-        self._status_tokens.setText("tokens: 0")
 
     def load_session(self, session_id: str) -> None:
         session = self.sessions.get(session_id)
@@ -566,7 +587,7 @@ class MainWindow(QMainWindow):
             Path(target).write_text(
                 self.sessions.export_markdown(self._current_session_id), encoding="utf-8"
             )
-            self.statusBar().showMessage(f"Exported to {target}", 5000)
+            self._flash(f"Exported to {target}", 5000)
         except OSError as exc:
             QMessageBox.critical(self, "Export", str(exc))
 
@@ -598,7 +619,6 @@ class MainWindow(QMainWindow):
         self.loop.settings = self.config.agent
         self._active_cards.clear()
         self._hidden_thinking_chars = 0
-        self._run_tokens = 0
         self._set_running(True)
 
         worker = AgentWorker(self.loop, text, parent=self)
@@ -612,7 +632,6 @@ class MainWindow(QMainWindow):
         worker.tool_finished.connect(self._on_tool_finished)
         worker.command_output.connect(self.terminal.append_stream)
         worker.file_changed.connect(self._on_file_changed)
-        worker.usage_updated.connect(self._on_usage_updated)
         worker.error_raised.connect(self._on_error)
         worker.finished_run.connect(self._on_run_finished)
         self.worker = worker
@@ -642,6 +661,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------- agent slots
     @Slot(str)
     def _on_status(self, text: str) -> None:
+        self._status_resting = text
         self._status_text.setText(text)
 
     @Slot(str)
@@ -671,7 +691,7 @@ class MainWindow(QMainWindow):
         self.task_panel.set_tasks(items)
         summary = tasks.summary_line() if hasattr(tasks, "summary_line") else ""
         if summary:
-            self.statusBar().showMessage(f"Plan: {summary}", 4000)
+            self._flash(f"Plan: {summary}", 4000)
 
     @Slot()
     def _update_process_badge(self) -> None:
@@ -733,11 +753,18 @@ class MainWindow(QMainWindow):
         if diff:
             self.editor.show_diff(path, diff)
 
-    @Slot(dict)
-    def _on_usage_updated(self, payload: dict) -> None:
-        """Show how many tokens the current run has cost so far."""
-        self._run_tokens += int(payload.get("total_tokens", 0))
-        self._status_tokens.setText(f"tokens: {self._run_tokens:,}")
+    def _flash(self, message: str, milliseconds: int = 3000) -> None:
+        """Show *message* in the status bar, then fall back to the real state.
+
+        ``QStatusBar.showMessage`` paints a temporary message *over* the
+        widgets already in the bar, which left two overlapping strings in the
+        corner. Driving the one label we own avoids that entirely.
+        """
+        self._status_text.setText(message)
+        QTimer.singleShot(
+            max(500, milliseconds),
+            lambda: self._status_text.setText(self._status_resting),
+        )
 
     @Slot(str)
     def _on_error(self, message: str) -> None:
@@ -760,8 +787,7 @@ class MainWindow(QMainWindow):
                 )
         self.chat.add_notice(
             f"{result.stop_reason.value} · {result.iterations} steps · "
-            f"{result.tool_calls} tool calls · {result.total_tokens:,} tokens · "
-            f"{result.duration_ms / 1000:.1f}s",
+            f"{result.tool_calls} tool calls · {result.duration_ms / 1000:.1f}s",
             "success" if result.ok else "error",
         )
         self._status_text.setText(f"Finished: {result.stop_reason.value}")

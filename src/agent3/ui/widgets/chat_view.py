@@ -27,11 +27,21 @@ from agent3.ui.diff_render import (
     render_diff_html,
     render_output_html,
 )
+from agent3.ui.markdown_render import markdown_to_html
 from agent3.ui.theme import COLORS, mono_font, role_colors
 from agent3.workspace.diffing import diff_stats
 
 #: Tallest an action-card detail pane may grow before it scrolls internally.
 DETAILS_MAX_HEIGHT = 340
+
+#: Background per chat role. Giving the two speakers different surfaces is
+#: what makes a long transcript skimmable without reading it.
+BUBBLE_SURFACES = {
+    "user": COLORS.bg_alt,
+    "assistant": COLORS.panel,
+    "system": COLORS.bg_alt,
+    "error": "#1d1417",
+}
 
 MARKDOWN_CSS = f"""
     body {{ color: {COLORS.text}; }}
@@ -160,7 +170,15 @@ class _AutoTextBrowser(QTextBrowser):
         cursor.endEditBlock()
 
     def set_markdown(self, text: str) -> None:
-        self.setMarkdown(text)
+        """Render *text* as markdown.
+
+        The conversion happens in :mod:`agent3.ui.markdown_render` rather than
+        through ``setMarkdown`` because Qt's own importer ignores the
+        document stylesheet, which throws away every colour, background and
+        border the theme defines. Going via HTML keeps the theme in charge
+        and buys syntax-highlighted code blocks on top.
+        """
+        self.setHtml(markdown_to_html(text))
         self._soften_code_blocks()
         self._fit()
 
@@ -174,14 +192,20 @@ class MessageBubble(QFrame):
         self._role = role
         self._buffer = text
         accent = role_colors().get(role, COLORS.text_dim)
+        # Your own turns sit on the flatter background and the agent's on the
+        # raised panel, so the eye can separate the two halves of the
+        # conversation before reading a single word.
+        surface = BUBBLE_SURFACES.get(role, COLORS.panel)
         self.setStyleSheet(
-            f"QFrame#Card {{ background-color: {COLORS.panel}; border: 1px solid {COLORS.border};"
-            f" border-left: 3px solid {accent}; border-radius: 8px; }}"
+            f"QFrame#Card {{ background-color: {surface};"
+            f" border: 1px solid {COLORS.border_soft};"
+            f" border-left: 3px solid {accent}; border-radius: 10px; }}"
+            f"QFrame#Card QLabel {{ background: transparent; }}"
         )
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 9, 12, 9)
-        layout.setSpacing(4)
+        layout.setContentsMargins(16, 12, 16, 13)
+        layout.setSpacing(7)
 
         header = QLabel(
             {"user": "YOU", "assistant": "AGENT3", "system": "SYSTEM", "error": "ERROR"}.get(
@@ -189,10 +213,12 @@ class MessageBubble(QFrame):
             )
         )
         header_font = QFont()
-        header_font.setPointSize(8)
+        header_font.setPointSizeF(8.0)
         header_font.setBold(True)
         header.setFont(header_font)
-        header.setStyleSheet(f"color: {accent}; letter-spacing: 1px;")
+        header.setStyleSheet(
+            f"color: {accent}; letter-spacing: 1.3px; background: transparent;"
+        )
         layout.addWidget(header)
 
         self._body = _AutoTextBrowser()
@@ -221,13 +247,15 @@ class ActionCard(QFrame):
         self._status = "running"
         self._details_text = ""
         self.setStyleSheet(
-            f"QFrame#Card {{ background-color: {COLORS.bg_alt}; border: 1px solid {COLORS.border};"
-            f" border-left: 3px solid {COLORS.warning}; border-radius: 8px; }}"
+            f"QFrame#Card {{ background-color: {COLORS.bg_alt};"
+            f" border: 1px solid {COLORS.border_soft};"
+            f" border-left: 3px solid {COLORS.warning}; border-radius: 10px; }}"
+            f"QFrame#Card QLabel {{ background: transparent; }}"
         )
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(12, 8, 12, 8)
-        outer.setSpacing(5)
+        outer.setContentsMargins(15, 10, 15, 11)
+        outer.setSpacing(7)
 
         header = QHBoxLayout()
         header.setSpacing(8)
@@ -452,8 +480,8 @@ class ChatView(QScrollArea):
 
         self._container = QWidget()
         self._layout = QVBoxLayout(self._container)
-        self._layout.setContentsMargins(14, 14, 14, 14)
-        self._layout.setSpacing(10)
+        self._layout.setContentsMargins(18, 16, 18, 18)
+        self._layout.setSpacing(13)
         self._layout.addStretch(1)
         self.setWidget(self._container)
 
@@ -481,7 +509,10 @@ class ChatView(QScrollArea):
         color = {"system": COLORS.text_faint, "error": COLORS.danger, "success": COLORS.success}.get(
             kind, COLORS.text_faint
         )
-        label.setStyleSheet(f"color: {color}; padding: 2px 6px;")
+        label.setStyleSheet(
+            f"color: {color}; padding: 5px 10px; background: transparent;"
+            f" font-size: 8pt; letter-spacing: 0.3px;"
+        )
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._insert(label)
         return label

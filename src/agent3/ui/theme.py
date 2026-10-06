@@ -17,12 +17,12 @@ from PySide6.QtWidgets import QApplication
 class Palette:
     """Named colour tokens used across the UI."""
 
-    bg: str = "#0f1115"
-    bg_alt: str = "#151921"
-    panel: str = "#171b23"
-    panel_alt: str = "#1c212b"
-    border: str = "#262c38"
-    border_soft: str = "#1f242e"
+    bg: str = "#0d0f14"
+    bg_alt: str = "#13161d"
+    panel: str = "#171b24"
+    panel_alt: str = "#1e2330"
+    border: str = "#252b38"
+    border_soft: str = "#1b202a"
     text: str = "#e6e9ef"
     text_dim: str = "#9aa4b5"
     text_faint: str = "#6b7484"
@@ -38,6 +38,17 @@ class Palette:
     removed_fg: str = "#f87171"
     hunk_fg: str = "#79c0ff"
     selection: str = "#264f78"
+
+    # Syntax token colours, shared by the editor highlighter and the HTML
+    # markdown renderer so a snippet looks identical in the chat and in a
+    # tab.
+    code_keyword: str = "#ff7b72"
+    code_builtin: str = "#79c0ff"
+    code_string: str = "#a5d6ff"
+    code_number: str = "#f2cc60"
+    code_comment: str = "#6b7484"
+    code_function: str = "#d2a8ff"
+    code_type: str = "#7ee787"
 
 
 COLORS = Palette()
@@ -83,33 +94,51 @@ def build_stylesheet(accent: str = COLORS.accent, font_size: int = 10) -> str:
     /* ---------------------------------------------------------- frames */
     QFrame#Card, QFrame#Panel {{
         background-color: {c.panel};
-        border: 1px solid {c.border};
-        border-radius: 8px;
+        border: 1px solid {c.border_soft};
+        border-radius: 10px;
     }}
+    /* A QLabel inherits the window background, which paints a dark slab
+       across any card it sits on. Every label inside a card has to be
+       transparent for the card to read as one surface. */
+    QFrame#Card QLabel, QFrame#Panel QLabel,
+    QFrame#Card QCheckBox, QFrame#Panel QCheckBox {{ background: transparent; }}
     QFrame#Separator {{ background-color: {c.border}; max-height: 1px; }}
 
+    /* A header band is the only divider between the stacked sidebar panes,
+       now that splitter handles stay invisible until you reach for one.
+       The band lives on the container so it spans the full width even when
+       the row also holds a counter or a button. */
+    QWidget#SectionHeader {{
+        background-color: {c.bg_alt};
+        border-top: 1px solid {c.border_soft};
+        border-bottom: 1px solid {c.border_soft};
+    }}
+    QWidget#SectionHeader QLabel, QWidget#SectionHeader QPushButton {{
+        background: transparent;
+    }}
     QLabel#SectionTitle {{
-        color: {c.text_dim};
-        font-size: {max(8, font_size - 1)}pt;
-        font-weight: 600;
-        letter-spacing: 1px;
-        padding: 8px 10px 4px 10px;
+        color: {c.text_faint};
+        font-size: {max(8, font_size - 2)}pt;
+        font-weight: 700;
+        letter-spacing: 1.4px;
+        padding: 0;
+        background: transparent;
     }}
     QLabel#Hint {{ color: {c.text_faint}; }}
     QLabel#StatusBadge {{
         color: {c.text_dim};
         background-color: {c.panel_alt};
-        border: 1px solid {c.border};
-        border-radius: 9px;
-        padding: 2px 8px;
+        border: 1px solid {c.border_soft};
+        border-radius: 10px;
+        padding: 3px 11px;
     }}
 
     /* --------------------------------------------------------- buttons */
     QPushButton {{
         background-color: {c.panel_alt};
         border: 1px solid {c.border};
-        border-radius: 6px;
-        padding: 6px 12px;
+        border-radius: 8px;
+        padding: 7px 14px;
         color: {c.text};
     }}
     QPushButton:hover {{ background-color: #222836; border-color: {accent}; }}
@@ -132,8 +161,8 @@ def build_stylesheet(accent: str = COLORS.accent, font_size: int = 10) -> str:
     QLineEdit, QPlainTextEdit, QTextEdit, QSpinBox, QDoubleSpinBox, QComboBox {{
         background-color: {c.bg_alt};
         border: 1px solid {c.border};
-        border-radius: 6px;
-        padding: 6px 8px;
+        border-radius: 8px;
+        padding: 8px 10px;
         selection-background-color: {c.selection};
         color: {c.text};
     }}
@@ -162,7 +191,7 @@ def build_stylesheet(accent: str = COLORS.accent, font_size: int = 10) -> str:
         selection-background-color: {c.selection};
         selection-color: {c.text};
     }}
-    QTreeView::item, QListWidget::item {{ padding: 3px 2px; border-radius: 4px; }}
+    QTreeView::item, QListWidget::item {{ padding: 5px 4px; border-radius: 6px; }}
     QTreeView::item:hover, QListWidget::item:hover {{ background-color: {c.panel_alt}; }}
     QHeaderView::section {{
         background-color: {c.panel_alt};
@@ -173,15 +202,15 @@ def build_stylesheet(accent: str = COLORS.accent, font_size: int = 10) -> str:
     }}
 
     /* ------------------------------------------------------------ tabs */
-    QTabWidget::pane {{ border: 1px solid {c.border}; border-radius: 6px; top: -1px; }}
+    QTabWidget::pane {{ border: 1px solid {c.border_soft}; border-radius: 10px; top: -1px; }}
     QTabBar::tab {{
         background-color: {c.bg_alt};
         color: {c.text_dim};
         border: 1px solid {c.border};
         border-bottom: none;
-        border-top-left-radius: 6px;
-        border-top-right-radius: 6px;
-        padding: 6px 14px;
+        border-top-left-radius: 8px;
+        border-top-right-radius: 8px;
+        padding: 7px 16px;
         margin-right: 2px;
     }}
     QTabBar::tab:selected {{ background-color: {c.panel}; color: {c.text}; border-bottom: 2px solid {accent}; }}
@@ -189,17 +218,21 @@ def build_stylesheet(accent: str = COLORS.accent, font_size: int = 10) -> str:
     QTabBar::close-button {{ subcontrol-position: right; }}
 
     /* --------------------------------------------------------- splitter */
-    QSplitter::handle {{ background-color: {c.border_soft}; }}
-    QSplitter::handle:horizontal {{ width: 3px; }}
-    QSplitter::handle:vertical {{ height: 3px; }}
-    QSplitter::handle:hover {{ background-color: {accent}; }}
+    /* The handle is breathing room you can drag, not a visible rule: it
+       only picks up a colour when the pointer is on it. */
+    QSplitter::handle {{ background-color: transparent; }}
+    QSplitter::handle:horizontal {{ width: 8px; }}
+    QSplitter::handle:vertical {{ height: 8px; }}
+    QSplitter::handle:hover {{ background-color: {c.border}; }}
+    QSplitter::handle:pressed {{ background-color: {accent}; }}
 
     /* ------------------------------------------------------- scrollbars */
-    QScrollBar:vertical {{ background: transparent; width: 11px; margin: 2px; }}
-    QScrollBar::handle:vertical {{ background: #2c3444; border-radius: 5px; min-height: 28px; }}
-    QScrollBar::handle:vertical:hover {{ background: #3a4457; }}
-    QScrollBar:horizontal {{ background: transparent; height: 11px; margin: 2px; }}
-    QScrollBar::handle:horizontal {{ background: #2c3444; border-radius: 5px; min-width: 28px; }}
+    QScrollBar:vertical {{ background: transparent; width: 10px; margin: 3px 2px; }}
+    QScrollBar::handle:vertical {{ background: #262d3b; border-radius: 4px; min-height: 36px; }}
+    QScrollBar::handle:vertical:hover {{ background: #394256; }}
+    QScrollBar:horizontal {{ background: transparent; height: 10px; margin: 2px 3px; }}
+    QScrollBar::handle:horizontal {{ background: #262d3b; border-radius: 4px; min-width: 36px; }}
+    QScrollBar::handle:horizontal:hover {{ background: #394256; }}
     QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; width: 0; }}
     QScrollBar::add-page, QScrollBar::sub-page {{ background: none; }}
 
@@ -215,8 +248,8 @@ def build_stylesheet(accent: str = COLORS.accent, font_size: int = 10) -> str:
     QProgressBar::chunk {{ background-color: {accent}; border-radius: 4px; }}
 
     /* ----------------------------------------------------------- menus */
-    QMenuBar {{ background-color: {c.bg_alt}; border-bottom: 1px solid {c.border}; }}
-    QMenuBar::item {{ padding: 6px 12px; background: transparent; }}
+    QMenuBar {{ background-color: {c.bg_alt}; border-bottom: 1px solid {c.border_soft}; padding: 2px 4px; }}
+    QMenuBar::item {{ padding: 6px 12px; border-radius: 6px; background: transparent; }}
     QMenuBar::item:selected {{ background-color: {c.panel_alt}; }}
     QMenu {{ background-color: {c.panel_alt}; border: 1px solid {c.border}; padding: 5px; }}
     QMenu::item {{ padding: 6px 24px 6px 18px; border-radius: 4px; }}
@@ -224,10 +257,11 @@ def build_stylesheet(accent: str = COLORS.accent, font_size: int = 10) -> str:
     QMenu::separator {{ height: 1px; background: {c.border}; margin: 4px 8px; }}
 
     /* --------------------------------------------------------- toolbar */
-    QToolBar {{ background-color: {c.bg_alt}; border-bottom: 1px solid {c.border}; spacing: 6px; padding: 5px; }}
+    QToolBar {{ background-color: {c.bg_alt}; border-bottom: 1px solid {c.border_soft}; spacing: 8px; padding: 7px 10px; }}
     QToolButton {{ background: transparent; border: 1px solid transparent; border-radius: 5px; padding: 5px 9px; }}
     QToolButton:hover {{ background-color: {c.panel_alt}; border-color: {c.border}; }}
-    QStatusBar {{ background-color: {c.bg_alt}; border-top: 1px solid {c.border}; color: {c.text_dim}; }}
+    QStatusBar {{ background-color: {c.bg_alt}; border-top: 1px solid {c.border_soft}; color: {c.text_dim}; padding: 3px 6px; }}
+    QStatusBar QLabel {{ background: transparent; }}
     QStatusBar::item {{ border: none; }}
 
     /* ------------------------------------------------------- scroll area */

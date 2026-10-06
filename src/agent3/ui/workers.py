@@ -36,7 +36,6 @@ class AgentWorker(QThread):
     tool_finished = Signal(object, object)  # ToolCall, ToolResult
     command_output = Signal(str, str)       # stream, text
     file_changed = Signal(str, str)         # path, unified diff
-    usage_updated = Signal(dict)
     error_raised = Signal(str)
     finished_run = Signal(object)           # AgentRunResult
 
@@ -63,7 +62,6 @@ class AgentWorker(QThread):
             on_tasks_changed=self.tasks_changed.emit,
             on_tool_start=self._emit_tool_start,
             on_tool_result=self._emit_tool_result,
-            on_usage=self.usage_updated.emit,
             on_error=self.error_raised.emit,
         )
         self._loop.context.on_command_output = self.command_output.emit

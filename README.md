@@ -322,10 +322,33 @@ outputs are supposed to name paths that do not exist yet.
 |---|---|
 | **Toolbar** | Workspace path · model picker (populated from `/api/tags`) · live connection badge |
 | **Left sidebar** | File explorer (lazy tree, context menu) · agent plan · session switcher |
-| **Centre** | Chat with markdown + syntax-highlighted code, and live **action cards** (`[AGENT] write_file … ✓ 12 ms`) with expandable output |
+| **Centre** | Chat with full markdown rendering (see below) and live **action cards** (`[AGENT] write_file … ✓ 12 ms`) with expandable output |
 | **Right** | Tabbed editor (line numbers, highlighting, dirty markers) + inline / side-by-side **diff viewer** |
 | **Bottom** | Embedded terminal: live agent output *and* your own commands with history |
-| **Status bar** | Agent state · tokens used by the current run |
+| **Status bar** | Agent state, plus transient notices (workspace mounted, plan updated, export finished) |
+
+### Markdown in the transcript
+
+Qt can parse markdown, but `QTextDocument.setMarkdown` builds the document
+programmatically and never consults the stylesheet, so every colour, border and
+background the theme defines was being discarded - the transcript came out as
+undifferentiated grey text. `agent3/ui/markdown_render.py` renders to HTML
+instead, which puts the theme back in charge and adds things Qt's importer
+cannot produce at all:
+
+| Markdown | Rendered as |
+|---|---|
+| Headings | Sized, with a rule under `#` and `##` |
+| `inline code` | Tinted background, monospace, code-string colour |
+| Fenced blocks | **Syntax highlighted** (Python, JS/TS, JSON, YAML, TOML, shell, C-family, SQL, CSS, markup, diff) with a language caption, wrapped rather than scrolled sideways |
+| Tables | Shaded header row, real borders, `:---:` alignment |
+| `- [x]` / `- [ ]` | ✓ / ○ checkboxes - the agent's plan reads as a plan |
+| Lists | Nested by indentation, coloured markers |
+| Blockquotes | Accent bar on the left, dimmed text |
+| Links, bare URLs, images | Clickable, in the accent colour |
+
+Everything is HTML-escaped before any markup is produced, and markdown inside a
+code span or fenced block stays literal.
 
 Shortcuts: `Ctrl+O` open workspace · `Ctrl+Enter` run · `Esc` stop · `Ctrl+S` save · `Ctrl+N` new
 session · `Ctrl+,` settings · ``Ctrl+` `` toggle terminal.

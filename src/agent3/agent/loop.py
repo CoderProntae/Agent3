@@ -59,7 +59,6 @@ class AgentCallbacks:
     on_assistant_message: Optional[Callable[[str], None]] = None
     on_tool_start: Optional[Callable[[ToolCall], None]] = None
     on_tool_result: Optional[Callable[[ToolCall, ToolResult], None]] = None
-    on_usage: Optional[Callable[[Dict[str, int]], None]] = None
     on_error: Optional[Callable[[str], None]] = None
 
     def emit(self, hook: str, *args) -> None:
@@ -296,14 +295,6 @@ class AgentLoop:
 
                 result.prompt_tokens += usage.prompt_tokens
                 result.completion_tokens += usage.completion_tokens
-                self.callbacks.emit(
-                    "on_usage",
-                    {
-                        "prompt_tokens": usage.prompt_tokens,
-                        "completion_tokens": usage.completion_tokens,
-                        "total_tokens": usage.total_tokens,
-                    },
-                )
 
                 self.history.append(ChatMessage.assistant(text))
                 prose = strip_tool_calls(text)

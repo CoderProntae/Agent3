@@ -187,7 +187,35 @@ class TestMainWindow:
             "_show_banner",
         ):
             assert not hasattr(window, attribute), f"{attribute} still exists"
-        assert "quota" not in window.statusBar().findChildren(type(window))
+        window.close()
+
+    def test_no_token_readout_survives_in_the_status_bar(self, qapp):
+        """Counting tokens stopped being meaningful once limits were gone."""
+        from PySide6.QtWidgets import QLabel
+
+        from agent3.core.config import ConfigManager
+        from agent3.ui.main_window import MainWindow
+
+        window = MainWindow(ConfigManager())
+        assert not hasattr(window, "_status_tokens")
+        assert not hasattr(window, "_run_tokens")
+        texts = " ".join(
+            label.text() for label in window.statusBar().findChildren(QLabel)
+        )
+        assert "token" not in texts.lower()
+        window.close()
+
+    def test_a_transient_message_never_doubles_up(self, qapp):
+        """_flash drives our own label; showMessage painted over it."""
+        from agent3.core.config import ConfigManager
+        from agent3.ui.main_window import MainWindow
+
+        window = MainWindow(ConfigManager())
+        window._on_status("Working")  # noqa: SLF001
+        window._flash("Workspace: /tmp/x", 500)  # noqa: SLF001
+        assert window._status_text.text() == "Workspace: /tmp/x"  # noqa: SLF001
+        assert window._status_resting == "Working"  # noqa: SLF001
+        assert window.statusBar().currentMessage() == ""
         window.close()
 
 

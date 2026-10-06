@@ -67,11 +67,34 @@ python -m agent3 --self-test   # model olmadan kurulumu doğrular
 |---|---|
 | Üst araç çubuğu | Çalışma klasörü ve menüler |
 | Sol kenar çubuğu | Dosya gezgini · **ajan planı (PLAN)** · oturum listesi |
-| Orta panel | Sohbet (markdown + kod vurgulama) ve canlı eylem kartları |
+| Orta panel | Sohbet (tam markdown desteği, aşağıda) ve canlı eylem kartları |
 | **Mesaj kutusunun altındaki şerit** | **Model seçici · düşünme anahtarı · düşünme düzeyi · bağlantı durumu** |
 | Sağ panel | Sekmeli kod düzenleyici + satır içi / yan yana fark görüntüleyici |
 | Alt panel | Gömülü terminal; başlıkta `● N background` rozeti arka planda çalışan süreçleri gösterir |
-| Durum çubuğu | Ajan durumu · o koşuda harcanan token |
+| Durum çubuğu | Ajan durumu ve geçici bildirimler (klasör bağlandı, plan güncellendi…) |
+
+### Sohbette markdown
+
+Qt'nin kendi `setMarkdown` fonksiyonu belgeyi programatik kuruyor ve tema
+stilini hiç okumuyordu; bu yüzden renkler, çerçeveler ve arka planlar çöpe
+gidiyor, cevaplar tek düze gri metin olarak görünüyordu. Artık kendi HTML
+üreticimiz var (`agent3/ui/markdown_render.py`):
+
+| Markdown | Nasıl görünüyor |
+|---|---|
+| Başlıklar | Kademeli punto, `#` ve `##` altında ince çizgi |
+| `satır içi kod` | Arka plan tonu, tek aralıklı yazı tipi |
+| ``` kod blokları | **Sözdizimi renklendirmesi** (Python, JS/TS, JSON, YAML, TOML, shell, C ailesi, SQL, CSS, HTML, diff), dil etiketi ve yana taşmak yerine satır sarma |
+| Tablolar | Gölgeli başlık satırı, gerçek kenarlıklar, `:---:` hizalama |
+| `- [x]` / `- [ ]` | ✓ / ○ kutucukları — ajanın planı plan gibi okunuyor |
+| Listeler | Girintiye göre iç içe, renkli işaretler |
+| Alıntılar | Solda vurgu çubuğu, soluk metin |
+| Bağlantılar ve URL'ler | Tıklanabilir, vurgu renginde |
+
+Her şey önce HTML olarak kaçışlanır; kod bloğunun veya `ters tırnağın` içindeki
+markdown olduğu gibi kalır.
+
+---
 
 ### Model ve düşünme şeridi
 
